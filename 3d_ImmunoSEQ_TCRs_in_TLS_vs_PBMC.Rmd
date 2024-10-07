@@ -1,0 +1,208 @@
+---
+title: "4_TCRs_in_TLS_vs_PBMC"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# I. Load libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(immunarch)
+library(kableExtra)
+
+#set saving parameters
+output.path = "output/adaptive/TLS_vs_PBMC/"
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+
+```
+
+# II. Load data 
+
+```{r}
+HCC_immdata<-readRDS("output/adaptive/HCC_immdata.rds")
+```
+
+# III. Analyze
+## a. Build reference PBMC objects and create objects for pre-post treatment pbmc (n=5)
+
+```{r}
+# pre-treatment pbmc
+pre_PBMC <- repFilter(
+    HCC_immdata,
+    .method = "by.meta",
+    .query = list(repertoire = include("TCRB"), type = include("PBMC"), time_point=include("Pre"))
+  )
+names(pre_PBMC$data) = pre_PBMC$data %>% names %>% str_replace("_PBMC.*", "") %>% str_replace("J17136_","")
+pre_PBMC = pre_PBMC$data 
+
+# post-treatment pbmc
+post_PBMC <- repFilter(
+    HCC_immdata,
+    .method = "by.meta",
+    .query = list(repertoire = include("TCRB"), type = include("PBMC"), time_point=include("Post"))
+  )
+names(post_PBMC$data) = post_PBMC$data %>% names %>% str_replace("_PBMC.*", "")%>% str_replace("J17136_","")
+post_PBMC = post_PBMC$data
+```
+
+## b. Create object test which is a filtered version of HCC_immdata
+
+```{r}
+### modify HCC_immdata to indicate if TCRs were present 
+test<-readRDS("output/adaptive/TCRB/HCC_immdata_TLS_TCRB_final_for_seurat.rds")
+
+test$meta =test$meta %>%
+  group_by(Patient.ID,type) %>% 
+  mutate(patient_tls_pub_id = paste0(Patient.ID," ", "#", Order#row_number()
+                             ),.after=Sample) %>% ungroup()
+test$meta = test$meta %>% filter(., !Patient.ID %in% c("OT1", "OT6"))
+
+####
+test.binded <- test$data %>%
+  bind_rows(., .id="Sample") %>%
+  mutate(Patient = str_replace(Sample, "-.*",""),.before=Sample)    #add patient column
+test.binded$Patient %>% table
+test.binded = test.binded[!test.binded$Patient %in% c("OT1", "OT6"),] #drops OT1 and OT6, for which ther eare no pre-post pbmc
+test.binded$Patient %>% table
+test.binded$Patient %>% unique
+test.binded$Patient = factor(test.binded$Patient, levels=unique(test.binded$Patient)) #sets levels
+test.binded <- test.binded %>% 
+  split(., f=.$Patient)  #split by patient
+names.test.binded = names(test.binded)
+
+test.binded %>% names
+
+test.binded <- lapply(1:length(test.binded), function(i) { 
+  mutate(test.binded[[i]], present_prePBMC = if_else(CDR3.aa %in% pre_PBMC[[names(test.binded)[i]]]$CDR3.aa, "shared","not shared"), .before=Clones) %>% 
+  mutate(test.binded[[i]], present_postPBMC = if_else(CDR3.aa %in% post_PBMC[[names(test.binded)[i]]]$CDR3.aa, "shared","not shared"), .before=Clones)
+}) %>% `names<-`(.,names.test.binded)
+
+test.binded = bind_rows(test.binded)
+test.binded$Patient %>% unique
+
+# test.binded$present_prePBMC = factor(test.binded$present_prePBMC, levels=unique(test.binded$present_prePBMC))
+# test.binded$present_postPBMC = factor(test.binded$present_postPBMC, levels=unique(test.binded$present_postPBMC))
+
+```
+
+# IV. Make plots and export descriptive data 
+## a. write generic functions for plotting and exporting descriptive data
+
+```{r}
+plot_percent <- function(df, reference) {
+  if (reference == "prePBMC") {df = rename(df, present = present_prePBMC)}
+  if (reference == "postPBMC") {df = rename(df, present = present_postPBMC)}
+
+  my_xaxis = list(
+    xlab("TLS"),
+  #   scale_x_discrete(
+  #     # labels= function(y) test$meta$new_name[match(y, test$meta$Sample)],
+  #     limits = rev(test$meta$Sample)), #rev added here to accomodate coord_flip
+    coord_flip(),
+  ggsci::scale_fill_d3(),
+  ggprism::theme_prism(),
+  scale_x_discrete(
+    labels= function(y) test$meta$patient_tls_pub_id[match(y, test$meta$Sample)],
+    limits = test$meta$Sample,drop=T) #rev added here to accomodate coord_flip
+  )
+  # theme(axis.text.x = element_text(angle=45, hjust=1,vjust=1))
+  
+  
+  output <- df  %>% 
+    # filter(Clones > 1) %>% #filter out singleton clonotypes
+    group_by(Patient, Sample, present) %>% summarise(count_uniqueTCR = n()) %>% 
+    group_by(Sample) %>% mutate(percent_uniqueTCR = prop.table(count_uniqueTCR) *100)
+  
+  p1 <- ggplot(output, aes(x = forcats::fct_rev(Sample), 
+                           y=percent_uniqueTCR, fill=present))+
+    geom_bar(position="stack", stat="identity",color="white")+
+    ggtitle(paste0("Repertoire sharing with ", 
+                   if (reference == "prePBMC") {"pretreatment PBMC"} else {"posttreatment PBMC"}))+ 
+    my_xaxis+
+    ylab("Proportion of unique TCR\u03B2 (%)")
+    # theme(axis.text.x=element_text(angle=45, hjust=1, vjust=1, face="bold"))
+  p1
+  
+  output.2 <- df %>% 
+    # filter(Clones > 1) %>% 
+    group_by(Patient, Sample, present) %>% summarise(sum_clones = sum(Clones)) %>% 
+    group_by(Sample) %>% mutate(percent_clones = prop.table(sum_clones)*100)
+
+  p2 <-   ggplot(output.2, aes(x = forcats::fct_rev(Sample), y=percent_clones, fill=present))+
+    geom_bar(position="stack", stat="identity",color="white")+
+    theme(axis.text.x=element_text(angle=45, hjust=1, vjust=1, face="bold"))+
+    ggtitle(paste0("Repertoire sharing with ", 
+                   if (reference == "prePBMC") {"pretreatment PBMC"} else {"posttreatment PBMC"}, 
+                   " (%)"))+ 
+    my_xaxis+
+    ylab("Proportion of total TCR\u03B2 (%)")
+    # ggsci::scale_fill_d3()+ggprism::theme_prism()
+  p2
+  return(list(p1,p2))
+}
+
+summary_percent <- function(df, reference) {
+  if (reference == "prePBMC") {df = rename(df, present = present_prePBMC)}
+  if (reference == "postPBMC") {df = rename(df, present = present_postPBMC)}
+
+  output <- df  %>%  #df for unique TCRs
+    # filter(Clones > 1) %>% #filter out singleton clonotypes
+    group_by(Patient, Sample, present) %>% summarise(count_uniqueTCR = n()) %>% 
+    group_by(Sample) %>% mutate(percent_uniqueTCR = prop.table(count_uniqueTCR) *100)
+
+  output.2 <- df %>% 
+    # filter(Clones > 1) %>% #df for total clones
+    group_by(Patient, Sample, present) %>% summarise(sum_clones = sum(Clones)) %>% 
+    group_by(Sample) %>% mutate(percent_clones = prop.table(sum_clones)*100)
+
+  output.3 <- left_join(output,output.2, by=c("Patient", "Sample", "present"))
+  write_tsv(output.3, file=paste0(output.path, reference, "_", "TLS_TCRs_compared_vs.tsv"))
+  
+  output %>% group_by(present) %>% summarise(Mean=mean(percent_uniqueTCR), Max=max(percent_uniqueTCR), Min=min(percent_uniqueTCR), Median=median(percent_uniqueTCR), Std=sd(percent_uniqueTCR)) %>% 
+  write_tsv(., file=paste0(output.path, reference, "_", "TLS_uniqueTCRs_summaryStats.tsv"))
+  
+  output.2 %>% group_by(present) %>% summarise(Mean=mean(percent_clones), Max=max(percent_clones), Min=min(percent_clones), Median=median(percent_clones), Std=sd(percent_clones)) %>% 
+    write_tsv(., file=paste0(output.path, reference, "_", "TLS_percent_Clones_summaryStats.tsv"))
+  
+  
+  output.3 %>%  filter(present=="shared") %>%  #filter to obtain only percentages of shared per  
+    summary %>% as.data.frame.matrix %>% 
+    writexl::write_xlsx(path=paste0(output.path,reference, "_", "descriptive_stats_percent_uniqueTCR_total_clones_shared_per_TLS_summaryFunction.xlsx"))
+
+}
+```
+## b. make plots / export descritive data
+```{r}
+#make plots for all clones
+pdf(paste0(output.path, "TLS_TCRs_compared_to_prePBMC.pdf"))
+b<-plot_percent(test.binded
+                # [test.binded$Patient %in% c("HCC02", "HCC08", "HCC09", "HCC13", "HCC14"),]
+                , "prePBMC")
+print(b)
+dev.off()
+
+pdf(paste0(output.path, "TLS_TCRs_compared_to_postPBMC.pdf"))
+c<-plot_percent(test.binded
+                # [test.binded$Patient %in% c("HCC02", "HCC08", "HCC09", "HCC13", "HCC14"),]
+                , "postPBMC")
+print(c)
+dev.off()
+
+
+summary_percent(test.binded, "prePBMC")
+summary_percent(test.binded, "postPBMC")
+
+```
+# V. SessionInfo
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_ImmunoSEQ_TCRs_in_TLS_vs_PBMC.txt")
+```
+

@@ -1,0 +1,260 @@
+---
+title: "scRNA sequencing analysis - preprocessing"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = T,
+                      warning = T, cache=F)
+```
+
+# I. Setup
+### a. Load libraries
+
+```{r libraries}
+# I installed v2 of sctransform on 5/19/2022. See below for hyperlink
+# devtools::install_github("satijalab/seurat", ref = "develop")
+# per https://satijalab.org/seurat/articles/sctransform_v2_vignette.html
+
+library(Seurat)
+library(sctransform)
+library(patchwork)
+library(Azimuth)
+library(ggplot2)
+library(tidyverse)
+library(glmGamPoi)
+library(tools)
+
+```
+
+### b.Set export settings
+
+```{r settings}
+source = "10x"
+analysis = "sc"
+type = "RNASeq" # "RNASeq", "TCR", "BCR"
+sample = "all"
+output.path = paste0("./output/single_cell/")
+output.prefix = paste0(source, "_", analysis, type, "_", sample, "_")
+```
+
+# II. Load data 
+### a. create Seurat object
+
+```{r load_data}
+data.dir <- "./data/single_cell/aggr_GE/filtered_feature_bc_matrix" 
+list.files(data.dir)
+tenx_data <- Read10X(data.dir = data.dir)
+seurat <- CreateSeuratObject(counts = tenx_data, min.cells = 3, min.features = 200)
+rm(tenx_data)
+```
+
+### b. Add metadata 
+Add columns "Patient" and "Type" and change orig.ident from "cellranger" to sample type + sample name (e.g. "PBMC_P02")
+
+```{r add_metadata}
+#create object based on terminal number in seurat object rownames barcode
+sample_num <- gsub(".*[-]", "", rownames(seurat@meta.data))
+
+#using the object sample_num, create a new vector to indicate sample identity
+#this code is based on https://stackoverflow.com/questions/30601413/change-an-integer-into-a-specific-string-in-a-data-frame
+#this code was developed for the whole dataset but works for single patients too
+
+trans = c("P02", "P03", "P07", "P08", "P12", "OT1", "OT6","OT6")
+names(trans) <- c(1, 2, 3, 4, 5, 6, 7, 8)
+sample_names <- trans[as.character(sample_num)]
+
+#using the object sample_num, create a new vector to indicate sample type (PBMC or TIL) 
+sample_type <- ifelse(sample_num == 8, "TIL", "PBMC")
+
+#add sample_names and sample_type to metadata
+seurat <- AddMetaData(
+  object=seurat,
+  metadata=sample_names,
+  col.name='Patient'
+)
+
+seurat <- AddMetaData(
+  object=seurat,
+  metadata=sample_type,
+  col.name='type'
+)
+
+#rename orig.ident column
+seurat$orig.ident <- paste(sample_type, sample_names, sep="_")
+```
+
+# III. Pre-processing
+
+```{r preprocessing}
+seurat <-PercentageFeatureSet(seurat, pattern = "^MT-", col.name = "percent.mt")
+
+# Use FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+plot1 <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by='orig.ident')
+plot2 <- FeatureScatter(seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",group.by='orig.ident')
+plot1 + plot2
+
+# Visualize QC metrics as a violin plot
+vln1 <- VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+vln2<- VlnPlot(seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),group.by = 'orig.ident') 
+vln1/vln2
+
+seurat.subset <- subset(seurat, subset = nFeature_RNA > 200 & nFeature_RNA < 4000 & percent.mt < 25) 
+
+vln3 <- VlnPlot(seurat.subset, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+vln4<- VlnPlot(seurat.subset, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),group.by = 'orig.ident') 
+vln3/vln4
+
+rm(seurat)
+rm(plot1)
+rm(plot2)
+rm(list=ls(pattern="^vln"))
+```
+
+# IV. Normalize Data with scTransform
+### a. Run SCTransform. 
+NOTE: I am not scaling the data based on this documentation (https://satijalab.org/seurat/articles/sctransform_vignette.html)
+
+```{r normalize}
+seurat.subset.scT <- SCTransform(seurat.subset,
+                                        method="glmGamPoi",
+                                        vst.flavor="v2",
+                                        vars.to.regress = "percent.mt",
+                                 return.only.var.genes = F #this is set to false so scale.data matrix contains all genes, not just variable genes
+                                        )
+
+#save object that has been subset to and scTransformed. If needing to revise can reload this object rather than re-running the above
+# saveRDS(seurat.subset.scT, file = paste(output.path,
+#                                           output.prefix,
+#                                           "seurat_scT.rds",
+#                                           sep=""
+#                                           )
+#         )
+
+# seurat.subset.scT <- readRDS("./output/single_cell/10x_scRNASeq_all_seurat_scT.rds") #this object is 7.6 GB 
+rm(seurat.subset)
+```
+
+### b. Perform dimensionality reduction 
+This is an amalgamation of the seurat vignettes here (https://satijalab.org/seurat/articles/sctransform_vignette.html) and here (https://satijalab.org/seurat/articles/pbmc3k_tutorial.html)
+
+```{r dimensionality_reduction_find_clusters}
+seurat.subset.scT.dimReduction <- RunPCA(seurat.subset.scT)
+rm(seurat.subset.scT)
+
+VizDimLoadings(seurat.subset.scT.dimReduction, dims = 1:2, reduction = "pca")
+DimPlot(seurat.subset.scT.dimReduction, reduction = "pca")
+DimHeatmap(seurat.subset.scT.dimReduction, dims = 1, cells = 500, balanced = TRUE)
+DimHeatmap(seurat.subset.scT.dimReduction, dims = 1:15, cells = 500, balanced = TRUE)
+ElbowPlot(seurat.subset.scT.dimReduction)
+seurat.subset.scT.dimReduction <- FindNeighbors(seurat.subset.scT.dimReduction, reduction="pca", dims = 1:12)
+
+```
+
+### c. Find clusters
+
+```{r find_clusters}
+saveRDS(seurat.subset.scT.dimReduction, file = paste(output.path, output.prefix,
+                             "seurat_pre_FindClusters.rds",
+                             sep=""))
+
+seurat.subset.scT.dimReduction <- readRDS("./output/single_cell/10x_scRNASeq_all_seurat_pre_FindClusters.rds")
+
+
+seurat.final <- FindClusters(object = seurat.subset.scT.dimReduction, resolution = 0.7)
+head(Idents(seurat.final), 5)
+seurat.final <- RunUMAP(seurat.final, reduction="pca", dims=1:12) 
+
+#Visualize with UMAP
+DimPlot(seurat.final, reduction = "umap")
+DimPlot(seurat.final, repel = T, split.by="orig.ident", ncol=3)
+
+saveRDS(seurat.final, file = paste(output.path,
+                             output.prefix,
+                             "seurat_final.rds",
+                             sep="")
+        )
+
+seurat.final <- readRDS("./output/single_cell/10x_scRNASeq_all_seurat_final.rds")
+
+# rm(list=ls(pattern="^seurat.subset"))
+```
+
+# V. Run Azimuth 
+Azimuth performs initial determination of cluster identity
+```{r azimuth}
+seurat.az <- RunAzimuth(seurat.final, reference = "pbmcref") #should rerun this for the TIL
+rm(seurat.final)
+
+seurat.az <- NormalizeData(seurat.az)
+
+# saveRDS(seurat.az, file = paste0(output.path,
+#                                    output.prefix,
+#                                    "seurat_az.rds"))
+# seurat.az <- readRDS("./output/single_cell/10x_scRNASeq_all_seurat_az.rds")
+
+################ Save PBMC and TIL as separate objects ################ 
+
+#create and size pbmc object
+seurat.az.pbmc <- subset(x=seurat.az, subset=type=="PBMC")
+#code to doublecheck subsetting
+# seurat.az@meta.data$type %>% table
+# seurat.az.pbmc@meta.data$type %>% table
+saveRDS(seurat.az.pbmc, file = paste0(output.path,
+                                   output.prefix,
+                                   "seurat_az_pbmc.rds"))
+rm(seurat.az.pbmc)
+
+#create and save TIL object
+seurat.az.til <- subset(x=seurat.az, subset=type=="TIL")
+seurat.az.til@meta.data$type %>% table
+saveRDS(seurat.az.til, file = paste0(output.path,
+                                     output.prefix,
+                                     "seurat_az_til.rds"))
+
+
+################ Make plots ################ 
+pdf("output/single_cell/preprocessing_azimuth.pdf")
+
+# DimPlot(seurat.az, group.by = "predicted.celltype.l1", label = TRUE, label.size = 3, label.box = T, repel=T) #+ NoLegend()
+# # DimPlot(seurat.az, split.by = "predicted.celltype.l1", ncol=3)
+
+DimPlot(seurat.az, group.by = "predicted.celltype.l2", label = TRUE, label.size = 3, label.box = F, repel=T) +
+  guides(color = guide_legend(override.aes=list(size=4), ncol=1)) #+ NoLegend()
+
+DimPlot(seurat.az, 
+        group.by = "predicted.celltype.l2", 
+        label = F, 
+        label.size = 3, 
+      #  label.box = T, 
+        repel=T,
+        split.by="orig.ident", ncol = 4) + 
+  guides(color = guide_legend(override.aes=list(size=4), ncol=1)) #+ NoLegend()
+
+DimPlot(seurat.az, group.by = "predicted.celltype.l3", label = TRUE, label.size = 3, label.box = F, repel=T) +
+    guides(color = guide_legend(override.aes=list(size=4), 
+                                ncol=2)) #+ NoLegend()
+
+DimPlot(seurat.az, 
+        group.by = "predicted.celltype.l3", 
+        label = TRUE, 
+        label.size = 3,
+        label.box = T, 
+        repel=T) + 
+  guides(color = guide_legend(override.aes=list(size=4), ncol=2)) #+ NoLegend()
+
+
+dev.off()
+```
+
+# VI. SessionInfo
+
+```{r sessioninfo}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_scRNA_preprocessing.txt")
+```

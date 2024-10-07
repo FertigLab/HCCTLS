@@ -1,0 +1,523 @@
+---
+title: "4_TCRs_in_TLS_vs_TDLN"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# I. Load libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(immunarch)
+library(kableExtra)
+library(ComplexUpset)
+library(scales) 
+
+#set saving parameters
+output.path = "output/adaptive/TLS_vs_TDLN/"
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+
+```
+
+# II. Load data
+```{r}
+HCC_immdata<-readRDS("output/adaptive/HCC_immdata.rds")
+```
+
+# III. TCRB
+## 1. Set Repertoire 
+```{r}
+tcrbcr = "TCRB" # c("TCRB","IGH")
+```
+## 1.5 prep data
+```{r prep_data}
+#Make object for TDLN repertoire
+TDLN <- repFilter(
+    HCC_immdata,
+    .method = "by.meta",
+    .query = list(repertoire = include(tcrbcr), 
+                  type = include("TDLN"))
+  )
+
+names(TDLN$data) = TDLN$data %>% names %>% str_replace(if_else(tcrbcr == "TCRB", "-T_TCRB","-B"),"")
+names(TDLN$data)
+TDLN$meta$Sample = str_replace(TDLN$meta$Sample, "-T_TCRB|-B","")
+TDLN$meta$Sample
+
+#subset just for OT1 TDLN #2 and OT6 TDLN1
+#here I remove OT1-TDLN1 and OT1 TDLN3 due to low clone count
+TDLN$data = TDLN$data[grep("OT1-TDLN2|OT6-TDLN1",names(TDLN$data))] 
+TDLN$meta = TDLN$meta[TDLN$meta$label %in% c("OT1-TDLN2", "OT6-TDLN1"),]
+
+
+TDLN_collapsed = list(OT1 = bind_rows(TDLN$data[grep("OT1",names(TDLN$data))]),
+                      OT6 = bind_rows(TDLN$data[grep("OT6",names(TDLN$data))]))
+
+
+#Make object with modified version of HCC_immdata to indicate if CDR3 are present in TDLN 
+test<-readRDS(paste0("output/adaptive/",tcrbcr,"/HCC_immdata_TLS_", tcrbcr, "_final_for_seurat.rds"))
+
+test$meta =test$meta %>%
+  group_by(Patient.ID,type) %>% 
+  mutate(patient_tls_pub_id = paste0(Patient.ID," ", "#", Order#row_number()
+                             ),.after=Sample) %>% ungroup()
+
+#subset both meta and data in test object for the two patients of interest OT1 and OT6 
+test$meta = test$meta %>% filter(., Patient.ID %in% c("OT1", "OT6"))
+test$data = test$data[names(test$data) %in% test$meta$Sample] 
+```
+## 2. Make plots
+```{r overlap_plots}
+#make test.binded object for plotting 
+test.binded <- test$data %>%
+  bind_rows(., .id="Sample") %>%
+  mutate(Patient = str_replace(Sample, "-.*",""),.before=Sample)    #add patient column
+test.binded$Patient %>% table
+test.binded = test.binded[test.binded$Patient %in% c("OT1", "OT6"),] 
+test.binded$Patient %>% table
+test.binded$Patient %>% unique
+test.binded$Patient = factor(test.binded$Patient, levels=unique(test.binded$Patient)) #sets levels
+test.binded <- test.binded %>% 
+  split(., f=.$Patient)  #split by patient
+names.test.binded = names(test.binded)
+
+test.binded %>% names
+
+# add column if clonotype in TLS were present in TDLN
+test.binded <- lapply(1:length(test.binded), function(i) { 
+  mutate(test.binded[[i]], present_TDLN = if_else(CDR3.aa %in% TDLN_collapsed[[names(test.binded)[i]]]$CDR3.aa, "shared","not shared"), .before=Clones) }) %>% `names<-`(.,names.test.binded)
+
+test.binded = bind_rows(test.binded)
+test.binded$Patient %>% unique
+
+## Make plots
+df = test.binded
+df = rename(df, present = present_TDLN)
+my_xaxis = list(
+    xlab("TLS"),
+    ggsci::scale_fill_d3(),
+    ggprism::theme_prism()
+  )
+  
+output <- df  %>% 
+    # filter(Clones > 1) %>% #filter out singleton clonotypes
+    group_by(Patient, Sample, present) %>% summarise(count_uniqueTCR = n()) %>% 
+    group_by(Sample) %>% mutate(percent_uniqueTCR = prop.table(count_uniqueTCR) *100)
+  
+  reference = test$meta %>% select(Sample, patient_tls_pub_id, TLS_type)
+  # reference
+  output = left_join(output, reference, by="Sample")
+
+p1 <- ggplot(output, aes(x = forcats::fct_rev(patient_tls_pub_id), y=percent_uniqueTCR, fill=present))+
+  geom_bar(position="stack", stat="identity",color="white")+
+  my_xaxis+
+  ggtitle(paste0(if_else(tcrbcr == "TCRB", 
+                                          "TCR\u03B2",
+                                          "IGH"), 
+                   " repertoire sharing with TDLN"))+ 
+                   ylab(paste0("Unique ", if_else(tcrbcr == "TCRB", 
+                                          "TCR\u03B2 (%)",
+                                          "IGH (%)")))+
+    facet_wrap(Patient~TLS_type, scales = "free")+
+    theme(axis.text.x = element_text(hjust=1,vjust=1,angle=45))
+  
+  
+ output.2 <- df %>%
+    # filter(Clones > 1) %>%
+    group_by(Patient, Sample, present) %>% summarise(sum_clones = sum(Clones)) %>%
+    group_by(Sample) %>% mutate(percent_clones = prop.table(sum_clones)*100)
+  output.2 = left_join(output.2, reference, by="Sample")
+
+  p2 <-   ggplot(output.2, aes(x = forcats::fct_rev(patient_tls_pub_id), y=percent_clones, fill=present))+
+    geom_bar(position="stack", stat="identity",color="white")+
+    my_xaxis+
+    ggtitle(paste0(if_else(tcrbcr == "TCRB",
+                                          "TCR\u03B2",
+                                          "IGH"),
+                   " repertoire sharing with TDLN"))+
+    ylab(paste0("Total ", if_else(tcrbcr == "TCRB",
+                                          "TCR\u03B2 (%)",
+                                          "IGH (%)")))+
+    facet_wrap(Patient~TLS_type, scales = "free")+
+    theme(axis.text.x = element_text(hjust=1,vjust=1,angle=45))
+
+
+
+#make plots for all clones
+pdf(paste0(output.path, "TLS_vs_TDLN_unique_", tcrbcr,".pdf"))
+p1
+
+dev.off()
+
+pdf(paste0(output.path, "TLS_vs_TDLN_total_", tcrbcr,".pdf"))
+p2
+dev.off()
+
+pdf(paste0(output.path, "TLS_vs_TDLN_combined_", tcrbcr,".pdf"))
+p1+ggtitle("")+p2+ggtitle("")+plot_layout(guides="collect",axis_titles = "collect_x",axes="collect")+plot_annotation(paste0(if_else(tcrbcr == "TCRB",
+                                          "TCR\u03B2","IGH"),
+                                          " repertoire sharing with TDLN"))
+dev.off()
+```
+## 3a. make upset plots, regular scale
+```{r upset_plots}
+#combine previously created objects "test" and "tdln"
+# first add tls_pub_id column to TDLN 
+TDLN$meta$patient_tls_pub_id = str_replace(TDLN$meta$Sample, "-TDLN.*", "-TDLN")
+TDLN$meta$tls_pub_id = str_replace(TDLN$meta$patient_tls_pub_id, "OT1 |OT6 ", "")
+
+#then combine objects
+test_and_TDLN = list(data =c(test$data, TDLN$data),
+                     meta = bind_rows(test$meta,TDLN$meta))
+
+for (i in c("OT1", "OT6")) {
+  length.test = length(test_and_TDLN$data[grep(i,names(test_and_TDLN$data))])
+  if (length.test > 1) {
+    temp <- test_and_TDLN$data[grep(i,names(test_and_TDLN$data))]
+    meta = test_and_TDLN$meta %>% ungroup() %>%  select(Sample,tls_pub_id)
+    #change names to drop # after TDLN
+    # names(temp) = str_replace(names(temp), "-T_TCRB|-B","")
+    
+    # #this returns unique clonotypes
+    # unique_clones <- sapply(temp,nrow)
+    # #this returns total clones 
+    # tot_clones <- sapply(temp, function(i) {sum(i$Clones)})
+    
+    #create data.frame in format needed for upset function, using the pubRep function from immunarch
+    upset_df <- pubRep(temp, "aa", .verbose = F)
+
+    #remove intersections where TDLN is not present, so we're not showing redundant info as other plots in paper
+    index = upset_df[[colnames(upset_df)[grep("TDLN",colnames(upset_df))]]]
+    upset_df = upset_df[complete.cases(index),] 
+  
+    #change column names for samples to tls_pub_id 
+    TLS_col_nums = grep(i, colnames(upset_df))
+    names(upset_df)[TLS_col_nums] = meta$tls_pub_id[match(colnames(upset_df)[TLS_col_nums],meta$Sample)]
+    # #pull column names of TLS for 'repertoires' object
+    repertoires=colnames(upset_df)[TLS_col_nums]
+
+    
+     
+    #add column for fill by adding a new column, tot_count, which sums across TLS_col_nums
+    upset_df <- upset_df %>% 
+      mutate(tot_count = select(., colnames(upset_df)[TLS_col_nums]) %>% rowSums(na.rm = TRUE))
+    #then add expansion column, which will have the value "singleton" or "expanded" according to the value of the new column
+    upset_df <- upset_df %>% 
+      mutate(expansion = case_when(tot_count==1 ~ "Singleton (n = 1)", 
+                                   tot_count >= 2 & tot_count <= 5 ~ "Small (n = 2-5)",
+                                   tot_count >= 6 & tot_count <=20 ~ "Medium (n = 6-20)", 
+                                   tot_count >=21 & tot_count <=100 ~ "Large (n = 21-100)",
+                                   tot_count > 100 ~ "Hyperexpanded (n > 100)")
+             )
+    upset_df$expansion <- factor(upset_df$expansion, levels=c("Singleton (n = 1)",
+                                                                "Small (n = 2-5)",
+                                                                "Medium (n = 6-20)", 
+                                                                "Large (n = 21-100)",
+                                                                "Hyperexpanded (n > 100)"))
+                      
+    expansion_colors = rev(ggsci::pal_futurama()(length(levels(upset_df$expansion))))
+    names(expansion_colors) = levels(upset_df$expansion)
+    
+    #convert counts per TLS to binary
+    nrow(upset_df)
+    cols_to_spare <- names(upset_df)[!names(upset_df) %in% repertoires] #first define columns that won't be converted
+    upset_df <- mutate_each(upset_df, funs(ifelse(is.na(.), 0, 1)), -cols_to_spare)
+    nrow(upset_df)
+    # View(upset_df)
+    
+    p <-upset(upset_df,
+      repertoires, name="Intersection Groups",
+      base_annotations=list(
+        'Intersections'=intersection_size(
+          counts=F
+          # text=list(
+          #   vjust=-1,
+          #   hjust=-1,
+          #   angle=90#,
+          #   # size=4
+          #   )
+        )
+      ),
+      annotations = list(
+        'Repertoire composition'=(
+          ggplot(mapping=aes(fill=expansion))
+          + geom_bar(stat='count', position='fill')
+          + scale_y_continuous(labels=scales::percent_format())
+          + scale_fill_manual(values=expansion_colors)
+          + ylab('Repertoire composition')
+          +theme(legend.title = element_blank(),
+                 legend.key.size = unit(0.5, 'cm'),
+                 legend.key=element_rect(colour="white"),
+                 legend.position="bottom") # removes legend title
+        )
+      ),
+      sort_intersections_by=c('degree','cardinality'),
+      sort_sets='descending',
+      width_ratio=0.1,
+      set_sizes=(
+        upset_set_size(
+          geom=geom_bar(
+            aes(fill=expansion, x=group),
+            width=0.8,
+            position="stack"),
+          position="right") 
+        # + geom_text(aes(label=..count..), hjust=1.1, stat='count')
+        # you can also add annotations on top of bars:
+        # + annotate(geom='text', label='@', x='Drama', y=850, color='white', size=3)
+        # + expand_limits(y=1100)
+        +scale_fill_manual(values=expansion_colors)
+        + theme(axis.text.x=element_text(angle=90),
+                axis.title.x = element_text(size=10),
+                legend.position = "none")
+        + ylab(paste0('Unique ', 
+                      if_else(tcrbcr == "TCRB",
+                              paste0("TCR","\U03B2"), "IGH")))
+                      # tcrbcr))
+        ),
+      min_size=
+        if_else(tcrbcr=="TCRB",20,1) # note I exclude intersections with < 20 TCRs for the sake of readability
+      # n_intersections=20 #set fixed # of interactions
+    )
+      # upset_test(upset_df,
+    #   repertoires)
+    p <- p +plot_annotation(title = paste0(if_else(tcrbcr == "TCRB", 
+                                              paste0("TCR","\U03B2"), 
+                                              "IGH"),
+                                      " clonotype sharing between TLS and TDLN for patient ", i))&
+      theme(text = element_text(#family="Arial",
+                                face="bold",hjust=0.5),
+        plot.title = element_text(hjust = 0.5,size=14))
+    pdf(paste0(output.path,"upset_plot_",i,"_",tcrbcr,".pdf"),height=6,width=8,onefile=T)
+    print(p)
+      dev.off()
+    if (i == "OT6"){
+          pdf(paste0(output.path,"upset_plot_",i,"_bigger","_",tcrbcr,".pdf"),height=9,width=15,onefile=FALSE); print(p); dev.off()
+    }
+    
+    write.csv(upset_df, paste0(output.path,"upset_df_", i, "_", tcrbcr,".csv"),row.names = F)
+    rm(list=c("p","upset_df","cols_to_spare","expansion_colors","repertoires","TLS_col_nums","temp"))
+    }
+  else {print(paste0("Upset plot skipped for patient ", i))
+    }
+}
+
+
+```
+## 3b. make upset plots, log scale
+```{r upset_plots_log}
+#combine previously created objects "test" and "tdln"
+# first add tls_pub_id column to TDLN 
+TDLN$meta$patient_tls_pub_id = str_replace(TDLN$meta$Sample, "-TDLN.*", "-TDLN")
+TDLN$meta$tls_pub_id = str_replace(TDLN$meta$patient_tls_pub_id, "OT1 |OT6 ", "")
+
+#then combine objects
+test_and_TDLN = list(data =c(test$data, TDLN$data),
+                     meta = bind_rows(test$meta,TDLN$meta))
+
+#before making upset plots,  revert to plotting pre-summarised data by passing the following function as data to geom_bar
+#this allows me to put log scale on intersections
+# https://stackoverflow.com/questions/71878037/how-to-to-assign-logarithmic-scale-to-intersection-size-using-complexupset-lib
+presence = ComplexUpset:::get_mode_presence('exclusive_intersection')
+
+summarise_values = function(df) {
+    aggregate(
+        as.formula(paste0(presence, '~ intersection')),
+        df,
+        FUN=sum
+    )
+}
+
+
+for (i in c("OT1", "OT6")) {
+  length.test = length(test_and_TDLN$data[grep(i,names(test_and_TDLN$data))])
+  if (length.test > 1) {
+    temp <- test_and_TDLN$data[grep(i,names(test_and_TDLN$data))]
+    meta = test_and_TDLN$meta %>% ungroup() %>%  select(Sample,label,tls_pub_id)
+    #change names to drop "-T_TCRB"
+    # names(temp) = str_replace(names(temp), "-T_TCRB|-B","")
+    
+    # #this returns unique clonotypes
+    # unique_clones <- sapply(temp,nrow)
+    # #this returns total clones 
+    # tot_clones <- sapply(temp, function(i) {sum(i$Clones)})
+    
+    #create data.frame in format needed for upset function, using the pubRep function from immunarch
+    upset_df <- pubRep(temp, "aa", .verbose = F)
+  
+   #remove intersections where TDLN is not present, so we're not showing redundant info as other plots
+    index = upset_df[[colnames(upset_df)[grep("TDLN",colnames(upset_df))]]]
+    upset_df = upset_df[complete.cases(index),] 
+    
+    #change column names for samples to tls_pub_id 
+    TLS_col_nums = grep(i, colnames(upset_df))
+    names(upset_df)[TLS_col_nums] = meta$tls_pub_id[match(colnames(upset_df)[TLS_col_nums],meta$Sample)]
+    # #pull column names of TLS for 'repertoires' object
+    repertoires=colnames(upset_df)[TLS_col_nums]
+
+    
+     
+    #add column for fill by adding a new column, tot_count, which sums across TLS_col_nums
+    upset_df <- upset_df %>% 
+      mutate(tot_count = select(., colnames(upset_df)[TLS_col_nums]) %>% rowSums(na.rm = TRUE))
+    #then add expansion column, which will have the value "singleton" or "expanded" according to the value of the new column
+    upset_df <- upset_df %>% 
+      mutate(expansion = case_when(tot_count==1 ~ "Singleton (n = 1)", 
+                                   tot_count >= 2 & tot_count <= 5 ~ "Small (n = 2-5)",
+                                   tot_count >= 6 & tot_count <=20 ~ "Medium (n = 6-20)", 
+                                   tot_count >=21 & tot_count <=100 ~ "Large (n = 21-100)",
+                                   tot_count > 100 ~ "Hyperexpanded (n > 100)")
+             )
+    upset_df$expansion <- factor(upset_df$expansion, levels=c("Singleton (n = 1)",
+                                                                "Small (n = 2-5)",
+                                                                "Medium (n = 6-20)", 
+                                                                "Large (n = 21-100)",
+                                                                "Hyperexpanded (n > 100)"))
+                      
+    expansion_colors = rev(ggsci::pal_futurama()(length(levels(upset_df$expansion))))
+    names(expansion_colors) = levels(upset_df$expansion)
+    
+    #convert counts per TLS to binary
+    nrow(upset_df)
+    cols_to_spare <- names(upset_df)[!names(upset_df) %in% repertoires] #first define columns that won't be converted
+    upset_df <- mutate_each(upset_df, funs(ifelse(is.na(.), 0, 1)), -cols_to_spare)
+    nrow(upset_df)
+    # View(upset_df)
+    
+    p <-upset(upset_df,
+      repertoires, name="Intersection Groups",
+      base_annotations=list(
+        # 'Intersections'=intersection_size(
+        #   counts=F
+        #   # text=list(
+        #   #   vjust=-1,
+        #   #   hjust=-1,
+        #   #   angle=90#,
+        #   #   # size=4
+        #   #   )
+        # )+scale_y_continuous(trans='log10')
+        'Intersections'=(
+            ggplot()
+            + geom_bar(data=summarise_values, 
+                       stat='identity', 
+                       aes(y=!!presence))
+            +ylab('Intersections')
+            +scale_y_log10(
+            # +scale_y_continuous(trans='log10',
+            #                     breaks = trans_breaks("log10", function(x) 10^x),
+                                labels=scales::comma)
+                                # labels = trans_format("log10", math_format(10^.x))) http://www.sthda.com/english/wiki/ggplot2-axis-scales-and-transformations#google_vignette
+        )
+      ),
+      annotations = list(
+        'Repertoire composition'=(
+          ggplot(mapping=aes(fill=expansion))
+          + geom_bar(stat='count', position='fill')
+          + scale_y_continuous(labels=scales::percent_format())
+          + scale_fill_manual(values=expansion_colors)
+          + ylab('Repertoire composition')
+          +theme(legend.title = element_blank(),
+                 legend.key.size = unit(0.5, 'cm'),
+                 legend.key=element_rect(colour="white"),
+                 legend.position="bottom") # removes legend title
+        )
+      ),
+      sort_intersections_by=c('degree','cardinality'),
+      sort_sets='descending',
+      width_ratio=0.1,
+      set_sizes=(
+        upset_set_size(
+          geom=geom_bar(
+            aes(fill=expansion, x=group),
+            width=0.8,
+            position="stack"),
+          position="right") 
+        # + geom_text(aes(label=..count..), hjust=1.1, stat='count')
+        # you can also add annotations on top of bars:
+        # + annotate(geom='text', label='@', x='Drama', y=850, color='white', size=3)
+        # + expand_limits(y=1100)
+        +scale_fill_manual(values=expansion_colors)
+        + theme(axis.text.x=element_text(angle=90),
+                axis.title.x = element_text(size=10),
+                legend.position = "none")
+        + ylab(paste0('Unique ', 
+                      if_else(tcrbcr == "TCRB",
+                              paste0("TCR","\U03B2"), "IGH")))
+                      # tcrbcr))
+        ),
+      min_size=
+        if_else(tcrbcr=="TCRB",20,1) # note I exclude intersections with < 20 TCRs for the sake of readability
+      # n_intersections=20 #set fixed # of interactions
+    )
+      # upset_test(upset_df,
+    #   repertoires)
+    p <- p +plot_annotation(title = paste0(if_else(tcrbcr == "TCRB", 
+                                              paste0("TCR","\U03B2"), 
+                                              "IGH"),
+                                      " clonotype sharing between TLS and TDLN for patient ", i))&
+      theme(text = element_text(#family="Arial",
+                                face="bold",hjust=0.5),
+        plot.title = element_text(hjust = 0.5,size=14))
+    pdf(paste0(output.path,"upset_plot_",i,"_",tcrbcr,"_log.pdf"),height=6,width=8,onefile=T)
+    print(p)
+      dev.off()
+    if (i == "OT6"){
+          pdf(paste0(output.path,"upset_plot_",i,"_bigger","_",tcrbcr,"_log.pdf"),height=9,width=15,onefile=FALSE); print(p); dev.off()
+    }
+    
+    write.csv(upset_df, paste0(output.path,"upset_df_", i, "_", tcrbcr,"_log.csv"),row.names = F)
+    rm(list=c("p","upset_df","cols_to_spare","expansion_colors","repertoires","TLS_col_nums","temp"))
+    }
+  else {print(paste0("Upset plot skipped for patient ", i))
+    }
+}
+
+
+```
+## 4. export summary stats
+```{r summary_stats}
+
+
+  output.3 <- left_join(output,output.2, by=c("Patient", "Sample",
+                                              "present",
+                                              "patient_tls_pub_id", 
+                                              "TLS_type"))
+  write_tsv(output.3, file=paste0(output.path, 
+                                  "TLS_vs_TDLN_", tcrbcr,".tsv"))
+  
+  output %>% group_by(present) %>% summarise(Mean=mean(percent_uniqueTCR), Max=max(percent_uniqueTCR), Min=min(percent_uniqueTCR), Median=median(percent_uniqueTCR), Std=sd(percent_uniqueTCR)) %>% 
+  write_tsv(., file=paste0(output.path, 
+                           "TLS_unique_summaryStats_",tcrbcr,".tsv"))
+  
+  output.2 %>% group_by(present) %>% summarise(Mean=mean(percent_clones), Max=max(percent_clones), Min=min(percent_clones), Median=median(percent_clones), Std=sd(percent_clones)) %>% 
+    write_tsv(., file=paste0(output.path, 
+                           "TLS_percent_Clones_summaryStats_",tcrbcr,".tsv"))
+
+   
+  output.3 %>%  filter(present=="shared") %>%  #filter to obtain only percentages of shared per 
+    split(.,.$TLS_type) %>% 
+    lapply(.,summary) %>% lapply(.,as.data.frame.matrix) %>% 
+    writexl::write_xlsx(path=paste0(output.path,                                "descriptive_stats_percent_unique_total_clones_shared_per_TLS_summaryFunction_",tcrbcr,".xlsx"))
+```
+# IV. IGH
+```{r}
+tcrbcr = "IGH" 
+<<prep_data>>
+<<overlap_plots>>
+<<upset_plots>>
+<<upset_plots_log>>
+<<summary_stats>>
+```
+
+# V. SessionInfo
+
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_ImmunoSEQ_TLS_vs_TDLN.txt")
+```
+

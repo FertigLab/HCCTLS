@@ -1,0 +1,169 @@
+---
+title: "Metadata creation"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# I. Load libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(immunarch)
+library(kableExtra)
+
+data_dir = "data/adaptive/"
+output.path = "output/adaptive/"
+#creates output.path directory if not already present
+ifelse(!dir.exists(output.path), dir.create(output.path), paste0(output.path, " ", "directory already exists"))
+```
+
+# II. Immunarch
+### a. Create and save HCC_immdata object
+note: these were downloaded from the adaptive website after filtering for in frame rearrangements, i.e. there are no noncoding clonotypes
+```{r}
+HCC_immdata <- repLoad(.path=data_dir)
+
+# HCC_immdata <- readRDS(file=paste0(output.path,"3b_compiled_HCC_immdata_obj.rds"))
+# saveRDS(HCC_immdata, file=paste0(output.path,"3b_compiled_HCC_immdata_obj.rds"))
+
+```
+
+### b. Set Levels
+```{r}
+HCC_immdata$meta$time_point <- factor(HCC_immdata$meta$time_point, levels=c("Pre", "Post"))
+HCC_immdata$meta$repertoire <- factor(HCC_immdata$meta$repertoire, levels=c("TCRB", "IGH"))
+HCC_immdata$meta$TLS_type <- factor(HCC_immdata$meta$TLS_type, levels=c("Mature", "Involuted"))
+HCC_immdata$meta$Location <- factor(HCC_immdata$meta$Location, levels=c("Intratumoral", "Peritumoral", "Adjacent Normal"))
+HCC_immdata$meta$Confirmed_CD21 <- factor(HCC_immdata$meta$Confirmed_CD21, levels=c("Yes", "No"), labels=c("CD21pos", "CD21neg"))
+```
+
+
+### c. Modify metadata by adding additional metadata pertaining to total # of clones (Clones), unique # of clones (Volume), and Shannon entropy
+Shannon Entropy code based on code from Janelle Montagne
+#### 1. total clones and unique clones 
+```{r}
+#adds # of total clones per sample to metadata and plots
+p1 <- repExplore(HCC_immdata$data, .method = "clones") #number of clones total
+p1
+HCC_immdata$meta <- merge(HCC_immdata$meta, p1, by = "Sample")
+
+#adds # of # of unique clones per sample to metadata and plots
+p2 <- repExplore(HCC_immdata$data, .method = "volume") #number of unique clonotypes
+HCC_immdata$meta <- merge(HCC_immdata$meta, p2, by = "Sample")
+p2
+```
+
+#### 2. shannon entropy
+
+```{r}
+#### Add shannon entropy
+#add Clonality column for Normalized Shannon's Entropy (Shannon's equitability- measure of evenness)
+#between 0 and 1, lower value indicates more evenness (more polyclonal), higher value indicates less evenness (1 is monoclonal)
+
+div_div <- repDiversity(coding(
+  HCC_immdata$data)
+  , "div", .q = 1, .col ="aa"
+) #.q = 1 gives you exp shannon
+div_div$clonotypes <- 0
+#convert from true diversity back to Shannon entropy
+div_div$Value <- log(div_div$Value)
+#Get number of clonotypes per sample to calculate normalized Shannon entropy
+for (i in 1:length(HCC_immdata[[1]])){
+  sample <- names(HCC_immdata[[1]][i])
+  test <- data.frame(coding(HCC_immdata[[1]][i]))
+  clonotypes <- length(unique(test[,4]))##make it based on amino acid clonotypes
+  div_div$clonotypes[i] <- clonotypes
+}
+
+# div_div$clonotypes <- div_div$clonotypes + 0.1 #to avoid 0 values
+#Calculate normalized Shannon entropy
+div_div$lnClonotypes <- log(div_div$clonotypes)
+div_div$shannon_norm <- div_div$Value/div_div$lnClonotypes
+div_div$Value <- 1-div_div$shannon_norm
+
+##Assign clonality to metadata
+clonalityDF <- div_div[,c(1:2)]
+colnames(clonalityDF) <- c("Sample", "clonality")
+HCC_immdata$meta <- merge(HCC_immdata$meta, clonalityDF, by = "Sample")
+```
+
+#### 3. Add column if TCR was present in pre or post treatment PBMC
+
+```{r}
+patients = HCC_immdata$meta$Patient.ID %>% unique
+
+#for all patients, adds columsn if the tcr in specific tls sampels was present in the pre-treatment biopsy
+for (x in 1:length(patients)){
+  patient = patients[x]
+  samples.of.interest = HCC_immdata$meta[HCC_immdata$meta$Patient.ID == patient & HCC_immdata$meta$repertoire=="TCRB" & HCC_immdata$meta$type=="TLS",]$Sample
+  # biopsy.of.interest = HCC_immdata$meta[HCC_immdata$meta$Patient.ID == patient & HCC_immdata$meta$type=="Biopsy",]$Sample
+  pbmc.pre.of.interest = HCC_immdata$meta[HCC_immdata$meta$Patient.ID ==patient & HCC_immdata$meta$time_point=="Pre" & HCC_immdata$meta$type=="PBMC",]$Sample
+  pbmc.post.of.interest = HCC_immdata$meta[HCC_immdata$meta$Patient.ID ==patient & HCC_immdata$meta$time_point=="Post" & HCC_immdata$meta$type=="PBMC",]$Sample
+
+  for (i in 1:length(samples.of.interest)){ 
+    # if (is_empty(biopsy.of.interest) == F) {HCC_immdata$data[[samples.of.interest[i]]]$present.in.biopsy =
+    #   if_else(HCC_immdata$data[[samples.of.interest[i]]]$CDR3.nt%in%HCC_immdata$data[[biopsy.of.interest]]$CDR3.nt, 1, 0)
+    # } else {
+    #   print(paste0("no biopsy sample for patient ",patient, " so present.in.biopsy column not added for sample ", samples.of.interest[i]))
+    #   HCC_immdata$data[[samples.of.interest[i]]]$present.in.biopsy = NA
+    #   }
+    #then if the patients have pre-post pbmc, add column to samples.of.interest, i.e. TLS dataframes, denoting if present in pre or post pbmc
+  if (patient %in% patients[1:5]){
+    HCC_immdata$data[[samples.of.interest[i]]]$present.in.pbmc.pre = if_else(HCC_immdata$data[[samples.of.interest[i]]]$CDR3.nt%in%HCC_immdata$data[[pbmc.pre.of.interest]]$CDR3.nt, 1, 0)
+    HCC_immdata$data[[samples.of.interest[i]]]$present.in.pbmc.post = if_else(HCC_immdata$data[[samples.of.interest[i]]]$CDR3.nt%in%HCC_immdata$data[[pbmc.post.of.interest]]$CDR3.nt, 1, 0)}
+  else {
+    HCC_immdata$data[[samples.of.interest[i]]]$present.in.pbmc.pre = NA
+    HCC_immdata$data[[samples.of.interest[i]]]$present.in.pbmc.post = NA}
+  }
+}
+```
+
+#### 4. For B cell repertoires, add valignsubstitution column
+
+```{r eval = T}
+bcr_adaptive_files <- list.files(path="data/adaptive", pattern = ".*-B.tsv",full.names=T)
+bcr_adaptive_files
+bcr_adaptive_data <- lapply(1:length(bcr_adaptive_files), function(i) {
+  read_tsv(file=bcr_adaptive_files[i],show_col_types = F)})
+names(bcr_adaptive_data) = bcr_adaptive_files %>% str_replace(.,".*adaptive/","") %>% str_replace(".tsv","")
+names(bcr_adaptive_data)
+bcr_adaptive_data_trimmed <- bcr_adaptive_data %>% bind_rows(.id="sample")  %>% 
+  select(sample, nucleotide,vAlignSubstitutionCount) %>% 
+  rename_with(.,tolower) %>%    #change all names to lowercase
+  split(., .$sample)   
+if (all(names(bcr_adaptive_data_trimmed) %in% names(HCC_immdata$data))==T){ #doublecheck that names are present
+  bnames = names(bcr_adaptive_data_trimmed)
+  for (i in bnames) {
+    HCC_immdata$data[[i]] = left_join(HCC_immdata$data[[i]],
+                                      select(bcr_adaptive_data_trimmed[[i]],nucleotide,valignsubstitutioncount),
+                                      by=join_by(Sequence==nucleotide))
+  }
+} 
+
+```
+
+### d. Save object 
+```{r}
+# Save object for further analysis
+saveRDS(HCC_immdata, paste0(output.path, "HCC_immdata.rds"))
+# HCC_immdata <- readRDS(paste0(output.path, "HCC_immdata.rds")) #this line loads the object
+```
+
+### e. Export table
+
+```{r}
+write.csv(HCC_immdata$meta, paste0(output.path, "HCC_immdata_metadata_all.csv"), row.names=F)
+```
+# III. SessionInfo
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_ImmunoSEQ_load_immunarchObject_and_filter.txt")
+```
+
+

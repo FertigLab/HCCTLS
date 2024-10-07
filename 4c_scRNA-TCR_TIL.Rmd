@@ -1,0 +1,1997 @@
+---
+title: "scRNA/TCR analysis - TIL"
+author: "Daniel Shu"
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+output: 
+  html_document:
+    keep_md: yes
+    toc: true
+    toc_float: true
+    collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F,
+                      warning = F, cache=F, 
+                      tidy = T,
+                      dpi = 600, fig.width = 12, fig.height = 8)
+```
+
+# I. Setup
+
+## A. Load libraries
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(ggprism)
+library(tidyverse)
+library(tools)
+library(scRepertoire)
+library(gridExtra)
+library(kableExtra)
+library(RColorBrewer)
+library(pals)
+library(ggnewscale)
+library(ggraph)
+library(scatterpie)
+```
+
+## B. Define export settings
+
+```{r settings}
+source = "10x"
+analysis = "sc"
+#Define the repertoire under study: "T" or "B"
+repertoire = "T" 
+#define type of repertoire
+type = "til" #pbmc or til
+#set azimuth level for analysis
+az_level = "l3" 
+output.path = paste0("./output/single_cell/", 
+                     ifelse(repertoire=="T", "T", "B"),
+                     "_", type, "_azimuth_", az_level,
+                     "/")
+#creates output.path directory if not already present
+ifelse(!dir.exists(output.path), dir.create(output.path), paste0(output.path, " ", "directory already exists")) 
+```
+
+## C. Load scripts
+
+```{r scripts}
+source("scripts/multibarHeatmap.R") # Load multibarHeatmap script
+source("./scripts/T_cell_goi.R") # Define GOI
+```
+
+# II. Load data
+
+### A. First load TCR/BCR filtered contig files
+
+```{r}
+#load combined object from pbmc analysis
+combined <- readRDS(paste0("./output/single_cell/T_pbmc_azimuth_l3/combined.rds"))
+```
+
+### B. Load the seurat object produced from data pre-processing.
+
+For preprocessing code, see "./scRNA-all-preprocessing.Rmd."
+
+Note that in the object seurat, the scaled data in the SCT assay is not
+present in the refAssay. This website
+(<https://github.com/satijalab/seurat/issues/5959>) notes that the
+refAssay lacks corrected UMI counts, so I switched the active.assay to
+SCT. see also here <https://github.com/satijalab/seurat/issues/2163>
+
+```{r load_seurat}
+#load seurat 
+seurat <- readRDS("./output/single_cell/10x_scRNASeq_all_seurat_az_til.rds")
+#set active assay to SCT
+DefaultAssay(seurat) <- "SCT"
+
+#Assign identities based on azimuth
+Idents(seurat) <- paste0("predicted.celltype.", az_level)
+
+#Re-order idents, which are out of order. 
+
+if (az_level == "l2") {
+levels.manual <-  c("B naive","B intermediate","B memory", "Plasmablast",
+                    "CD4 Naive","CD4 Proliferating","CD4 TCM","CD4 TEM","CD4 CTL",
+                    "CD8 Naive","CD8 Proliferating","CD8 TCM","CD8 TEM","NK","NK Proliferating",
+                    "Treg","dnT","gdT","MAIT",
+                    "CD14 Mono","CD16 Mono","Platelet")
+} 
+if (az_level == "l3") {
+levels.manual <- c("B naive kappa","B naive lambda", "B intermediate kappa", "B intermediate lambda", "B memory kappa","B memory lambda", "Plasma",
+                   "CD14 Mono","CD16 Mono",
+                   "CD4 Naive","CD4 Proliferating", "CD4 TCM_1","CD4 TCM_2","CD4 TCM_3","CD4 TEM_1","CD4 TEM_2","CD4 TEM_3","CD4 CTL", 
+                   "CD8 Naive","CD8 Naive_2","CD8 Proliferating",
+                   "CD8 TCM_1","CD8 TCM_2","CD8 TCM_3",
+                   "CD8 TEM_1","CD8 TEM_2","CD8 TEM_3","CD8 TEM_4","CD8 TEM_5","CD8 TEM_6",
+                   "NK Proliferating","NK_1","NK_2",
+                   "Treg Naive", "Treg Memory","dnT_1","dnT_2", "gdT_1","gdT_2","gdT_3","gdT_4","MAIT",  
+                   "ILC","Platelet")
+}
+Idents(seurat) <- factor(x = Idents(seurat), levels = levels.manual)
+Idents(seurat) %>% levels
+
+cells.by.type <- table(Idents(seurat)) %>% as.data.frame() 
+ggplot(cells.by.type, aes(x = Var1, #reorder(Var1, desc(Freq)), 
+                          y = Freq, fill=Var1))+
+  geom_col()+ #scale_fill_manual(value=pals::kovesi.rainbow_bgyr_35_85_c72(nrow(cells.by.type)))+
+  ggprism::theme_prism()+theme(axis.text.x = element_text(angle=45, hjust=1, vjust=1))+theme(legend.position="null")+ggtitle("Single cells per cluster")+xlab("Cluster")+ylab("Cell count")
+  ggsave(paste0(output.path,"summary_all_B_and_T_asbarplot.pdf"),width=8,height=12)
+
+cells.by.type %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Summary of all cell types (B and T)", align = 'c') %>%
+  kable_classic(full_width=F) %>% 
+  save_kable(., paste0(output.path, "summary_all_B_and_T.pdf"))
+
+DimPlot(seurat)
+ggsave(paste0(output.path, "dimplot_all_T_and_B.pdf"))
+
+#Subset for sample under analysis and add initial "T-" or "B-" to barcode
+if (repertoire == "T") {
+  T.clustOfInterest = "CD4|CD8|Treg|dnT|gdT|ILC|MAIT|NK"
+  seurat.idents = unique(Idents(seurat))
+  T.idents <- seurat.idents[grep(T.clustOfInterest, seurat.idents)] 
+  seurat <- subset(seurat, idents = T.idents)
+  seurat <- RenameCells(seurat, new.names = paste0("T-", rownames(seurat[[]])))
+  } else {
+  # this is the case where repertoire == "B"
+  B.clustOfInterest = "B naive|B intermediate|B memory|Plasma"
+  seurat.idents = unique(Idents(seurat))
+  B.idents <- seurat.idents[grep(B.clustOfInterest, seurat.idents)]
+  seurat <- subset(seurat, idents = B.idents)
+  seurat <- RenameCells(seurat, new.names = paste0("B-", rownames(seurat[[]])))
+}
+
+## Subset to remove outlier singletons using cellSelector 
+DimPlot(seurat#,cols=cluster_colors
+        ) +ggtitle(paste0("T cell clusters in TIL prior to singletons removal (n=", nrow(seurat@meta.data), ")"))
+ggsave(filename = paste0(output.path, "dimplot_before_singleton_removal.pdf"),width = 12, height = 8)
+
+plot <- DimPlot(seurat)
+select.cells <- CellSelector(plot = plot) #select cells in top right then click done
+seurat <- subset(seurat, cells = select.cells)
+
+DimPlot(seurat#,cols=cluster_colors
+        ) +ggtitle(paste0("T cell clusters in TIL after singletons removal (n=", nrow(seurat@meta.data), ")"))
+ggsave(filename = paste0(output.path, "dimplot_after_singleton_removal.pdf"),width = 12, height = 8)
+
+saveRDS(seurat, paste0(output.path, "seurat_after_singleton_removal.rds"))
+# seurat <- readRDS(file=paste0(output.path, "seurat_after_singleton_removal.rds"))
+
+```
+
+### C. Run FindAllMarkers and make heatmap to refine cluster idents
+
+```{r}
+markers <- FindAllMarkers(seurat, test.use = "MAST", only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25)
+
+saveRDS(markers, file=paste0(output.path,"findAllMarkers.rds"))
+# markers <- readRDS(paste0(output.path,  "findAllMarkers.rds"))
+
+markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 3, order_by = avg_log2FC)
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =10, wt = avg_log2FC) -> top10
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =5, wt = avg_log2FC) -> top5
+
+#getting this error when I try to do DoHeatmap
+# Error in Seurat::DoHeatmap(seurat, features = top10, size = 2) : 
+#   No requested features found in the scale.data slot for the SCT assay.
+# so rescaling the data per https://github.com/satijalab/seurat/issues/2960
+
+seurat<-ScaleData(seurat, features=c(markers$gene,goi.all), verbose = FALSE)#this line makes sure that all of the variable features (in markers object) and all of the genes of interest are included in the scaledata used for the heatmap
+                  
+pdf(paste0(output.path,"FindAllMarkers_after_singleton_removal_before_cluster_annotation.pdf"),width=12,height=8)
+Seurat::DoHeatmap(seurat,features=top5$gene,size=2)+
+ theme(legend.text = element_text(size = 6),
+      axis.text.y = element_text(size = 6))
+dev.off()
+pdf(paste0(output.path,"GOI_all__after_singleton_removal_before_cluster_annotation.pdf"),width=12,height=8)
+Seurat::DoHeatmap(seurat,features=goi.all,size = 2)+
+   theme(legend.text = element_text(size = 6),
+      axis.text.y = element_text(size = 6))
+dev.off()
+```
+
+### D.1 Reassign cluster idents
+
+```{r load_seurat2}
+## Collapse the clusters that are not the focus of this analysis (i.e. e.g. Treg naive + Treg memory -> Treg, etc.). Here I have applied this to NKT)
+cluster_merge = data.frame(old_id = levels(seurat), new_id = NA, level=NA)
+write.csv(cluster_merge,"output/single_cell/cluster_merge_TIL.csv",row.names=F)
+#edit that file with manual cluster assignments then reupload
+cluster_merge_DS <- read.csv("output/single_cell/cluster_merge_DS.csv")
+cluster_merge_DS = cluster_merge_DS[order(cluster_merge_DS$level),] #reorder by level column, which will be used below to facilitate levels assignment
+
+#set colors for clusters 
+cluster_colors = pals::alphabet(n=length(unique(cluster_merge_DS$new_id))+2)
+cluster_colors = cluster_colors[-grep("iron|ebony",names(cluster_colors))] #drops black
+names(cluster_colors) = unique(cluster_merge_DS$new_id)
+
+cluster_colors %>% pal.bands()
+
+#######################
+#assign new identities
+new.cluster.ids = cluster_merge_DS$new_id
+names(new.cluster.ids) = cluster_merge_DS$old_id
+
+new.cluster.ids
+if (all(unique(Idents(seurat)) %in% names(new.cluster.ids)) == T) { #doublechecks that the new.cluster.ids has a new ident for each old ident, before subsetting the new.cluster.ids object for what is in Idents(seura)
+new.cluster.ids <- new.cluster.ids[names(new.cluster.ids) %in% Idents(seurat)] #rename the clusteres that are present in the dataset
+}
+
+seurat <- RenameIdents(seurat, new.cluster.ids)
+
+#add active.ident column to seurat object (will be used below for stacked barplots)
+seurat$active.ident <- Idents(seurat)
+Idents(seurat) %>% table #check idents
+
+#set levels
+levels.manual = unique(cluster_merge_DS$new_id)
+Idents(seurat) <- factor(x = Idents(seurat), levels = levels.manual)
+
+pdf(paste0(output.path,"DimPlot_after_annotation.pdf"));DimPlot(seurat,cols=cluster_colors);dev.off()
+pdf(paste0(output.path,"DimPlot_after_annotation_labeled.pdf"));DimPlot(seurat,cols=cluster_colors,label=T,repel=T);dev.off()
+
+# ## subset to remove clusters where there are fewer than 10 cells
+seurat <- subset(x = seurat, idents = c("NK-T", "ILC"), invert=T)
+
+pdf(paste0(output.path,"DimPlot_after_annotation_lessthan10removed.pdf"));
+DimPlot(seurat,cols=cluster_colors,pt.size=3);
+dev.off()
+pdf(paste0(output.path,"DimPlot_after_annotation_labeled_lessthan10removed.pdf"));
+DimPlot(seurat,cols=cluster_colors,label=T,repel=T,pt.size=3);
+dev.off()
+
+saveRDS(seurat, paste0(output.path, "seurat_after_singleton_removal_after_annotation.rds"))
+# seurat <- readRDS(seurat, file=paste0(output.path, "seurat_after_singleton_removal_after_annotation.rds"))
+```
+
+### D.2. Manual curation
+#### A. Reassign CXCL13 expressing cluster in dnT
+There is a small set of CXCL13 expressing cells in dnT cluster, which appear to be different from other dnT cells
+Here we figure out are they CD4 or CD8 and reassign them to either Tph, CD8 TEM_GZMK, or CD8 TEM_GZMB
+In the end, 9 went to Tph and 2 went to CD8 TEM_GZMK
+
+```{r}
+cxcl13_dnt  <- subset(x = seurat, subset = CXCL13 > 0, idents = "dnT") 
+
+select.cells <- colnames(cxcl13_dnt)
+select.cells
+
+Idents(seurat, cells = select.cells) <- "NewCells"
+
+# Now, we find markers that are specific to the new cells, and find clear DC markers
+newcells.markers <- FindMarkers(seurat, ident.1 = "NewCells", ident.2 = "CD8 TEM_GZMB", min.diff.pct = 0.3,
+    only.pos = TRUE)
+newcells.markers %>% arrange(.,avg_log2FC)
+
+# VlnPlot(seurat, idents="dnT", features=c("CXCL13"))+geom_jitter()
+VlnPlot(seurat, idents="NewCells", features=c("CXCL13","CD4", "CD8A", "CD8B", "ICOS", "PDCD1", "CTLA4", "GZMK", "GZMB","TOX","MAF"),ncol=4)
+FeaturePlot(seurat,cells=select.cells, features=c("CXCL13","CD4","CD8A"))
+FeatureScatter(seurat, cells=select.cells,feature1 = "CD4", feature2 = "CD8A")
+
+#Based on the plots above, will assign anything with CD8A expression > 0 to CD8_TEM_unk, and assign rest to CD4 Tph
+CD8_TEM_unk  <- subset(x = seurat, subset = CD8A > 0, idents = "NewCells") 
+select.cells_CD8 <- colnames(CD8_TEM_unk)
+Idents(seurat, cells = select.cells_CD8) <- "NewCells_CD8"
+VlnPlot(seurat, idents="NewCells_CD8", features=c("CXCL13","CD8A", "GZMK", "GZMB","TOX","MAF"),ncol=4)
+Idents(seurat, cells = select.cells_CD8) <- "CD8 TEM_GZMK" #final identity of these 2 cells is CD8_TEM_GZMK
+
+#now for the rest of the NewCells
+reassigned_Tph <- subset(x = seurat, idents = "NewCells") 
+select.cells.Tph <- colnames(reassigned_Tph)
+Idents(seurat, cells = select.cells.Tph) <- "CD4 Tph" #final identity of these 2 cells is 
+
+Idents(seurat) %>% table
+
+```
+
+#### B. Reassign ZNF683 expressing cells in CD8 TCM and CD8 TEM_TRM
+```{r}
+Idents(seurat) %>% table
+exclude  <- subset(x = seurat, subset = ZNF683 > 0, idents = "CD8 TCM") 
+
+select.cells <- colnames(exclude)
+select.cells %>% length
+
+Idents(seurat, cells = select.cells) <- "NewCells"
+
+newcells.markers <- FindMarkers(seurat, ident.1 = "NewCells", ident.2 = "CD8 TCM", min.diff.pct = 0.3,
+    only.pos = TRUE)
+newcells.markers %>% arrange(.,avg_log2FC) %>% tail
+
+# VlnPlot(seurat, idents="dnT", features=c("CXCL13"))+geom_jitter()
+VlnPlot(seurat, idents="NewCells", features=c("CXCL13","CD4", "CD8A", "CD8B", "ICOS", "PDCD1", "CTLA4", "GZMK", "GZMB","TOX","MAF","ZNF683", "NR4A1","SELL","TCF7","CCR7"),ncol=4)
+Idents(seurat, cells = select.cells) <- "CD8 TRM" #final identity of these cells is
+
+#######################
+### Now from CD8 TRM, pull out the cells that don't express ZNF683 
+### these shoudl have high SELL, TCF7 expression c/w a TCM phenotype 
+### the high expressors of CD8A and ZNF683 should remain as TRMs
+exclude  <- subset(x = seurat, subset = ZNF683 == 0, idents = "CD8 TRM") 
+
+select.cells <- colnames(exclude)
+select.cells
+
+Idents(seurat, cells = select.cells) <- "NewCells"
+
+# Now, we find markers that are specific to the new cells vs old cluster
+newcells.markers <- FindMarkers(seurat, ident.1 = "NewCells", ident.2 = "CD8 TRM", min.diff.pct = 0.3,
+    only.pos = TRUE)
+newcells.markers %>% arrange(.,avg_log2FC) #high KLF2, KLF3, SELL expression -- I take this to indicate CD8 TCM phenotype
+
+#now try it against the destination cluster
+newcells.markers <- FindMarkers(seurat, ident.1 = "NewCells", ident.2 = "CD8 TCM", 
+                                min.diff.pct = 0.3,
+    only.pos = TRUE)
+newcells.markers %>% arrange(.,avg_log2FC)
+
+# VlnPlot(seurat, idents="dnT", features=c("CXCL13"))+geom_jitter()
+VlnPlot(seurat, idents="NewCells", features=c("CXCL13","CD4", "CD8A", "CD8B", "ICOS", "PDCD1", "CTLA4", "GZMK", "GZMB","TOX","MAF","ZNF683", "NR4A1","SELL","TCF7","CCR7"),ncol=4)
+Idents(seurat, cells = select.cells) <- "CD8 TCM" #final identity of these 2 cells is
+
+Idents(seurat) %>% table
+```
+
+#### C. Re-set levels and set active.ident column
+
+```{r}
+#need to re-set the levels
+levels(seurat)
+Idents(seurat) <- factor(x = Idents(seurat), levels = levels.manual)
+
+#set active.ident column
+seurat$active.ident <- Idents(seurat)
+
+## make new dimplot and save
+pdf(paste0(output.path,"DimPlot_after_annotation_lessthan10removed_dnT_reassigned.pdf"));
+DimPlot(seurat,cols=cluster_colors,pt.size=3);
+dev.off()
+pdf(paste0(output.path,"DimPlot_after_annotation_lessthan10removed_dnT_reassigned_noLegend.pdf"));
+DimPlot(seurat,cols=cluster_colors,pt.size=3)&NoLegend();
+dev.off()
+
+pdf(paste0(output.path,"DimPlot_after_annotation_lessthan10removed_dnT_reassigned_noLegend_noAxes.pdf"));
+DimPlot(seurat,cols=cluster_colors,pt.size=3)&NoLegend()&NoAxes();
+dev.off()
+
+pdf(paste0(output.path,"DimPlot_after_annotation_lessthan10removed_dnT_reassigned_yesLegend_noAxes.pdf"));
+DimPlot(seurat,cols=cluster_colors,pt.size=3)&NoAxes()#&NoLegend() 
+dev.off()
+
+pdf(paste0(output.path,"DimPlot_after_annotation_labeled_lessthan10removed_dnT_reassigned.pdf"));
+DimPlot(seurat,cols=cluster_colors,label=T,repel=T,pt.size=3);
+dev.off()
+
+# saveRDS(seurat, paste0(output.path, "seurat_after_singleton_removal_after_annotation_dnT_reassigned.rds"))
+# seurat <- readRDS(seurat, file=paste0(output.path, "seurat_after_singleton_removal_after_annotation_dnT_reassigned.rds"))
+```
+
+
+### E.1 Re-run findallmarkers and make new figures
+```{r}
+markers <- FindAllMarkers(seurat, test.use = "MAST", only.pos = TRUE, min.pct = 0.1, logfc.threshold = 0.25)
+
+saveRDS(markers, file=paste0(output.path,"findAllMarkers_post_clusterassignment.rds"))
+# markers <- readRDS(paste0(output.path,"findAllMarkers_post_clusterassignment.rds"))
+
+#subset to remove mitochondrial genes
+nrow(markers)
+grep("MT-",markers$gene)
+markers$gene[grep("MT-",markers$gene)]
+markers = markers[-grep("MT-",markers$gene),]
+grep("MT-",markers$gene)
+nrow(markers)
+
+markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 3, order_by = avg_log2FC)
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =10, wt = avg_log2FC) -> top10
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =5, wt = avg_log2FC) -> top5
+
+markers %>%
+    group_by(cluster) %>%
+    top_n(n =3, wt = avg_log2FC) -> top3
+
+seurat<-ScaleData(seurat, features=c(markers$gene,goi.all), verbose = FALSE)
+
+#make new heatmaps
+pdf(paste0(output.path,"FindAllMarkers_after_singleton_removal_after_cluster_annotation_top3.pdf"),width=12,height=8)
+Seurat::DoHeatmap(seurat,features=top3$gene,size=2)+
+ theme(legend.text = element_text(size = 8),
+      axis.text.y = element_text(size = 8)) & NoLegend()
+dev.off()
+
+pdf(paste0(output.path,"FindAllMarkers_after_singleton_removal_after_cluster_annotation_top3_downsample.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample = 30),
+                  features=top3$gene,size=2)+
+ theme(legend.text = element_text(size = 8),
+      axis.text.y = element_text(size = 8)) & NoLegend()
+dev.off()
+
+pdf(paste0(output.path,"FindAllMarkers_after_singleton_removal_after_cluster_annotation_top5.pdf"),width=12,height=8)
+Seurat::DoHeatmap(seurat,features=top5$gene,size=2)+
+ theme(legend.text = element_text(size = 8),
+      axis.text.y = element_text(size = 8)) & NoLegend()
+dev.off()
+
+pdf(paste0(output.path,"FindAllMarkers_after_singleton_removal_after_cluster_annotation_top5_downsample.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample = 30),
+                  features=top5$gene,size=2)+
+ theme(legend.text = element_text(size = 8),
+      axis.text.y = element_text(size = 8)) & NoLegend()
+dev.off()
+
+pdf(paste0(output.path,"FindAllMarkers_after_singleton_removal_after_cluster_annotation_top10.pdf"),width=12,height=8)
+Seurat::DoHeatmap(seurat,features=top10$gene,size=2)+
+ theme(legend.text = element_text(size = 8),
+      axis.text.y = element_text(size = 6)) & NoLegend()
+dev.off()
+
+pdf(paste0(output.path,"FindAllMarkers_after_singleton_removal_after_cluster_annotation_top10_downsample.pdf"),width=12,height=8)
+Seurat::DoHeatmap(subset(seurat, downsample = 30),
+                  features=top10$gene,size=2)+
+ theme(legend.text = element_text(size = 8),
+      axis.text.y = element_text(size = 6)) & NoLegend()
+dev.off()
+
+pdf(paste0(output.path,"GOI_all__after_singleton_removal_after_cluster_annotation.pdf"),width=12,height=8)
+Seurat::DoHeatmap(seurat,features=goi.all,size = 2)+
+   theme(legend.text = element_text(size = 8),
+      axis.text.y = element_text(size = 6)) & NoLegend()
+dev.off()
+
+```
+
+### E.2 make figures and tables for final object
+
+```{r load_seurat_plots}
+#############################################################################
+##### make figures and tables for final object
+# make dimplot of final clustering of all samples
+DimPlot(seurat, cols=cluster_colors, pt.size=4)+  
+ggtitle(paste0(
+  ifelse(repertoire=="T", "T", "B"),
+                                  " cell clusters in sc", str_to_upper(type),
+                                  " (n = ", nrow(seurat@meta.data), ")")) +
+  theme(legend.position = "right", 
+        legend.text = element_text(size=12)) 
+ggsave(filename = paste0(output.path, "dimplot_all_including_cells_without_TCR.pdf"),width = 10, height = 8)
+
+#make barplot and table
+cells.by.type.t.only <- table(Idents(seurat)) %>% as.data.frame() 
+ggplot(cells.by.type.t.only, aes(x = reorder(Var1, Freq), #fct_rev(Var1),
+                          y = Freq, fill=Var1))+
+  geom_col()+  scale_fill_manual(values=cluster_colors)+
+  geom_text(aes(label = Freq), hjust =-0.2)+
+  ggprism::theme_prism()+
+  # theme_classic()+
+  theme(axis.text.x = element_text(angle=45, hjust=1, vjust=1))+
+  theme(legend.position="null",
+        text=element_text(size=20),)+
+  ggtitle("Single cells per cluster")+
+  xlab("Cluster")+ylab("Cell count")+
+  coord_flip(clip="off")
+#  theme(plot.margin = unit(c(1,1,1,1), "lines"))
+
+ggsave(paste0(output.path,"summary_all_T_only_asbarplot.pdf"))
+
+cells.by.type.t.only %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Summary of all cell types (after subsetting for T cells, low counts not removed)", align = 'c') %>%
+  kable_classic(full_width=F) %>% 
+  save_kable(., paste0(output.path, "summary_all_T_only.pdf"))
+
+
+```
+
+### F. Add scTCR/BCR data to seurat
+
+```{r add_tcrbcr}
+#combine TCR or BCR data with seurat object
+#note that I have previously changed the barcodes in the combined file for each sample to match the barcodes in the seurat object
+seurat <- combineExpression(combined, seurat, 
+                            cloneCall="gene", group.by = "sample", proportion = FALSE, 
+                            cloneTypes=c(Single=1, Small=5, Medium=20, Large=100, Hyperexpanded=500))
+
+seurat@meta.data$cloneType <- factor(seurat@meta.data$cloneType, levels = c(
+  "Hyperexpanded (100 < X <= 500)",
+  "Large (20 < X <= 100)",
+  "Medium (5 < X <= 20)",
+  "Small (1 < X <= 5)",
+  "Single (0 < X <= 1)", NA))
+
+#Subset seurat object to remove cells lacking a barcode (i.e. without TCR/BCR)
+#Before doing this, create 2 table to give sense of # of cells removed 
+seurat@meta.data$hasTCR = if_else(is.na(seurat@meta.data$barcode), "No", "Yes")
+seurat@meta.data %>% count(hasTCR, sort=T) %>%   
+  bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Summary of cells with and without TCRs", align = 'c') %>%
+  kable_classic(full_width=F) %>%
+  save_kable(., paste0(output.path, "summary_cells_with_without_TCR.pdf"))
+
+seurat@meta.data %>% count(active.ident, hasTCR) %>% group_by(active.ident) %>% arrange(desc(hasTCR), .by_group=T) %>% ungroup %>% bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  kbl(caption = "Summary of cells with and without TCRs, by cluster", align = 'c') %>%
+  kable_classic(full_width=F) %>%
+  save_kable(., paste0(output.path, "summary_cells_with_without_TCR_byCluster.pdf"))
+
+#Save seurat object
+# seurat <- readRDS(paste0(output.path,"seurat_after_TCR.rds"))
+saveRDS(seurat, file=paste0(output.path,"seurat_after_TCR.rds"))
+```
+
+### G. Add Adaptive TLS TCR/IGH data
+this is the new version 9/13/2023
+```{r map_clonotypes}
+#load adaptive HCC_immdata with additional info re: specific TLS
+adaptiveTLS <- readRDS("output/adaptive/TCRB/HCC_immdata_TLS_TCRB_final_for_seurat.rds")
+
+#subset for OT6
+adaptiveTLS$data = adaptiveTLS$data[grep("OT6", names(adaptiveTLS$data))]
+adaptiveTLS$meta = adaptiveTLS$meta[adaptiveTLS$meta$Patient.ID=="OT6",]
+length(adaptiveTLS$data) == nrow(adaptiveTLS$meta)
+
+#make pseudoTIL object 
+adaptive <- adaptiveTLS$data %>%
+  bind_rows(.,.id="Patient") %>% 
+  mutate_at("Patient",str_replace,"-.*", "") %>% 
+  uncount(.,Clones) %>% #uncount clones column 
+  select(-Proportion) %>% 
+  select(Patient,CDR3.aa) %>% #,V.name,D.name,J.name,Sequence) %>% 
+  group_by(#Patient,
+           CDR3.aa) %>%
+  mutate(Clones=n(), .after = "Patient") %>%
+  distinct(CDR3.aa, .keep_all=T) %>% 
+  # ungroup() %>% group_by(Patient) %>%  
+  mutate(Proportion = Clones/sum(.$Clones), .after=Clones) %>% 
+  arrange(desc(Clones)) %>% 
+  mutate(Rank=1:n(), .before = "Patient") %>% ungroup() %>% 
+  split(.,.$Patient)
+
+adaptive %>% names
+# adaptive = adaptive[levels(adaptiveTLS$meta$Patient.ID)] #reorder adaptive object
+adaptive %>% names
+
+#this is housekeeping to doublecheck the number of duplicated CDR3aa and CDRnt per sample in the adaptive data
+x<- lapply(1:length(adaptive), function(i) {
+  adaptive[[i]][duplicated(adaptive[[i]]$CDR3.aa) | duplicated(adaptive[[i]]$CDR3.aa, fromLast =T),] %>% 
+    nrow
+}) %>% unlist
+
+df <- tibble(names(adaptive), sapply(adaptive, nrow), x)
+colnames(df) = c("sample", "total.clonotypes", "duplicated.cdr3.aa")#, "duplicated.cdr3.nt"
+df
+
+#########
+#create adaptive.bindrows object, which  will be used to determine which TCRs are present in TLS
+adaptive.bindrows <- adaptive %>% #removes OT1-TDLN and OT6-TDLN
+  bind_rows(., .id = "Sample") %>%    #collapses list into one dataframe
+  dplyr::select(-'Patient') #removes "Patient" column, leaving "Sample" which will be used below
+
+#Add column to seurat object for TCRB or IGH data (this allows cross-referencing of single cell  against Adaptive datasets)
+seurat$TCRB_or_IGH <- gsub(".*_", "", seurat@meta.data$CTaa)
+
+# add the second column for TCRB or IGH
+seurat$TCRB_or_IGH2 = NA
+# find entries that should be split by ; 
+tosplit = grep(";",seurat$TCRB_or_IGH ) 
+# split by ";" and add the second part to TCRB_or_IGH2 
+seurat@meta.data[tosplit,"TCRB_or_IGH2"] <- sapply(strsplit(seurat@meta.data[tosplit,"TCRB_or_IGH"],";"), function(x) x[[2]]) 
+# and replace TCRB_or_IGH with the first half 
+# you need to do it in this order, otherwise you will loose the second part
+seurat@meta.data[tosplit,"TCRB_or_IGH"] <- sapply(strsplit(seurat@meta.data[tosplit,"TCRB_or_IGH"],";"), function(x) x[[1]])
+
+#these 3 lines doublecheck that this worked
+seurat@meta.data[tosplit, "TCRB_or_IGH"]
+seurat@meta.data[tosplit, "TCRB_or_IGH2"]
+grep(";",seurat$TCRB_or_IGH ) %>% length
+
+##########
+
+#now add column to seurat metadata and adaptive.bindrows with sample name_tcrb -- this will facilitate adding a column to single cell metadata that shows if the TCRB is present in patient's TLS  
+seurat$patient_tcrb <- paste(seurat@meta.data$Patient, seurat@meta.data$TCRB_or_IGH, sep="_") #this and belone line does create instances of HCC02_NA, etc. but this is okay because there are no NAs in the CDR3.aa in the adaptive data
+seurat$patient_tcrb2 <- paste(seurat@meta.data$Patient, seurat@meta.data$TCRB_or_IGH2, sep="_") 
+adaptive.bindrows$Sample_CDR3.aa <- paste(adaptive.bindrows$Sample, adaptive.bindrows$CDR3.aa, sep="_")
+
+#Add column to seurat object if there is any match in TLS sequencing data for that particular patient
+seurat$TLS.present1 <- ifelse(seurat@meta.data$patient_tcrb %in% adaptive.bindrows$Sample_CDR3.aa, 1, 0)
+seurat$TLS.present2 <- ifelse(seurat@meta.data$patient_tcrb2 %in% adaptive.bindrows$Sample_CDR3.aa, 1, 0)
+
+#consolidate the two columns into one column, which is true if either of the two TCRBs were found in the patient's TLS
+seurat$TLS.present = ifelse(seurat$TLS.present1+seurat$TLS.present2 >= 1, 1, 0)
+
+seurat@meta.data[tosplit,c("TLS.present", "TLS.present1", "TLS.present2")]
+
+#########
+#Now create adaptive.excludeSingletons which is adaptive.bindrows subsetted for Clones > 1, i.e. the TLS data excluding singletons
+#Then add column to seurat object if the clone is expanded in TLS (count > 1), i.e. present in the now .excludeSingletons object 
+adaptive.excludeSingletons = adaptive.bindrows[adaptive.bindrows$Clones > 1,] 
+seurat$TLS.expanded1 <- ifelse(seurat@meta.data$patient_tcrb %in% adaptive.excludeSingletons$Sample_CDR3.aa, 1,0)
+seurat$TLS.expanded2 <- ifelse(seurat@meta.data$patient_tcrb2 %in% adaptive.excludeSingletons$Sample_CDR3.aa, 1,0)
+seurat$TLS.expanded = ifelse(seurat$TLS.expanded1+seurat$TLS.expanded2 >= 1, 1, 0)
+
+#create object seurat.TLS, which is a subset of seurat metadata that contains only cells present in TLS (clones >=1)
+seurat.TLS <- seurat@meta.data %>% filter(TLS.present==1) 
+
+#Create object seurat.TLS.excludeSingletons, which is a subset of seurat metadata that contains only cells with TCRs expanded in TLS (clones >1)
+seurat.TLS.excludeSingletons <- seurat@meta.data %>% filter(TLS.expanded == 1)
+
+#create 2 lists with the suffix .bypatient, which are seurat.TLs and seurat.TLS.excludeSingletons split by orig.ident
+seurat.TLS.bypatient <- split(seurat.TLS, f=seurat.TLS$orig.ident)
+seurat.TLS.excludeSingletons.bypatient <- split(seurat.TLS.excludeSingletons, f=seurat.TLS.excludeSingletons$orig.ident)
+
+#remove adaptive.bindrows object
+rm(adaptive.bindrows)
+
+# saveRDS(seurat, file=paste0(output.path,"seurat_post_addition_of_TCR.rds"))
+# seurat <- readRDS(paste0(output.path,"seurat_post_addition_of_TCR.rds"))
+```
+
+### H. Summarize cross-referenced single cell and TLS data
+
+```{r basic statistics-1}
+summaryTable_by_cluster <- seurat@meta.data %>% group_by(active.ident) %>% 
+  summarise(
+    Total_cells=n(),
+    Total_cells_with_TCR=sum(hasTCR=="Yes"),
+    Total_cells_with_TCR_expanded=sum(Frequency>1, na.rm=T),
+    # Total_unique_TCRB=(n_distinct(c(TCRB_or_IGH,TCRB_or_IGH2))),
+    Cells_with_TCR_in_TLS=sum(TLS.present)
+    ) %>%
+  bind_rows(summarise(.,across(where(is.numeric), sum), across(where(is.factor), ~"Total"))) %>%
+  mutate(Total_cells_with_TCR_expanded = paste0(Total_cells_with_TCR_expanded, " (", round(100*Total_cells_with_TCR_expanded/Total_cells_with_TCR,1), ")")) %>% 
+
+  mutate(Cells_with_TCR_in_TLS = paste0(Cells_with_TCR_in_TLS, " (", round(100*Cells_with_TCR_in_TLS/Total_cells_with_TCR,1), ")")) %>% 
+  
+  rename(c(
+    'Cluster' = active.ident,
+    'Cells, n' = Total_cells,
+    'Cells with TCR, n' = Total_cells_with_TCR,
+    'Cells with expanded TCRs, n (%)' = Total_cells_with_TCR_expanded,
+    'Cells with TCR\u03B2 in TLS, n (%)' = Cells_with_TCR_in_TLS#,
+    # 'Unique TCR\u03B2 in TLS, n (%)'= Unique_TCRs_in_TLS
+           )) 
+
+summaryTable_by_cluster
+summaryTable_by_cluster %>% 
+  writexl::write_xlsx(.,paste0(output.path, "summaryTable_by_cluster_final.xlsx"))
+summaryTable_by_cluster %>% 
+  kbl(caption = "Summary of cross-referenced single cell data by cluster", align = 'c') %>%
+  kable_classic(full_width=F) %>% 
+  save_kable(., paste0(output.path, "summaryTable_by_cluster_final.pdf"))
+
+rm(summaryTable_by_cluster)
+
+#####################
+names.Patient <- unique(seurat@meta.data$Patient)
+
+all.TCR = c()
+all.TCR.recovered = c()
+unique.TCR = c()
+unique.TCR.recovered = c()
+unique.TCR.singleton = c()
+unique.TCR.singleton.recovered = c()
+unique.TCR.expanded = c()
+unique.TCR.expanded.recovered = c()
+
+for (i in 1:length(names.Patient)) {
+  all.TCR = c(all.TCR, sum(adaptive[[i]]$Clones))
+  all.TCR.recovered = c(all.TCR.recovered, length(seurat.TLS[seurat.TLS$Patient == names.Patient[i],]$TCRB_or_IGH))
+  unique.TCR = c(unique.TCR, nrow(adaptive[[i]]))
+  unique.TCR.recovered = c(unique.TCR.recovered, length(unique(seurat.TLS[seurat.TLS$Patient == names.Patient[i],]$TCRB_or_IGH)))
+  
+  uniqueSharedTCR= unique(seurat.TLS[seurat.TLS$Patient == names.Patient[i],]$TCRB_or_IGH)
+  unique.TCR.singleton = c(unique.TCR.singleton, nrow(adaptive[[i]][adaptive[[i]]$Clones == 1,]))
+  unique.TCR.singleton.recovered = c(unique.TCR.singleton.recovered, 
+                                     nrow(adaptive[[i]][adaptive[[i]]$Clones ==1 & adaptive[[i]]$CDR3.aa%in% uniqueSharedTCR,]))
+  
+  unique.TCR.expanded = c(unique.TCR.expanded, nrow(adaptive[[i]][adaptive[[i]]$Clones > 1,]))
+  unique.TCR.expanded.recovered = c(unique.TCR.expanded.recovered, 
+                                    nrow(adaptive[[i]][adaptive[[i]]$Clones > 1 & adaptive[[i]]$CDR3.aa%in% uniqueSharedTCR,]))
+}
+
+top10.pct = c()
+top10.pct.recovered = c()
+top1.pct = c()
+top1.pct.recovered = c()
+top01.pct = c()
+top01.pct.recovered = c()
+
+for (i in 1:length(names.Patient)) {
+  uniqueSharedTCR= unique(seurat.TLS[seurat.TLS$Patient == names.Patient[i],]$TCRB_or_IGH)
+  top10.pct = c(top10.pct, round(nrow(adaptive[[i]]) *.1))
+  top10.pct.recovered = c(top10.pct.recovered, 
+                          sum(adaptive[[i]][1:round(nrow(adaptive[[i]]) *.1),]$CDR3.aa %in% uniqueSharedTCR))
+  top1.pct = c(top1.pct, round(nrow(adaptive[[i]]) *.01))
+  top1.pct.recovered = c(top1.pct.recovered, 
+                         sum(adaptive[[i]][1:round(nrow(adaptive[[i]]) *.01),]$CDR3.aa %in% uniqueSharedTCR))
+  top01.pct = c(top01.pct, round(nrow(adaptive[[i]]) *.001))
+  top01.pct.recovered = c(top01.pct.recovered, 
+                          sum(adaptive[[i]][1:round(nrow(adaptive[[i]]) *.001),]$CDR3.aa %in% uniqueSharedTCR))
+}
+
+df3 = data.frame("Patient" = names.Patient, 
+                 unique.TCR,unique.TCR.recovered,
+                 top10.pct, top10.pct.recovered, 
+                 top1.pct, top1.pct.recovered,
+                 top01.pct,top01.pct.recovered) %>%  
+  # bind_rows(summarise_all(., ~if(is.numeric(.)) {sum(.)} else "Total")) %>% 
+  mutate(., 'Total TCR\u03B2 matched, n (%)' = paste0(unique.TCR.recovered, "/", unique.TCR, 
+                                                      " (", signif(unique.TCR.recovered/unique.TCR *100, digits = 2), ")"),  
+         .after = unique.TCR) %>% 
+  mutate(., 'Top 10% of TCR\u03B2 matched, n (%)' = paste0(top10.pct.recovered,  "/", top10.pct,
+                                                      " (", 
+                                                      signif(top10.pct.recovered/top10.pct *100, digits = 2), 
+                                                      ")"),  .after = top10.pct) %>% 
+  mutate(., 'Top 1% of TCR\u03B2 matched, n (%)' = paste0(top1.pct.recovered, "/", top1.pct,
+                                                     " (", 
+                                                     signif(top1.pct.recovered/top1.pct *100, digits = 3), 
+                                                     ")"),  .after = top1.pct) %>% 
+  mutate(., 'Top 0.1% of TCR\u03B2 matched, n (%)' = paste0(top01.pct.recovered, "/", top01.pct,
+                                                       " (", 
+                                                       signif(top01.pct.recovered/top01.pct *100, digits = 2), 
+                                                       ")"),  .after = top01.pct) %>% 
+  select(-c(unique.TCR,
+            unique.TCR.recovered,
+                 top10.pct, top10.pct.recovered, 
+                 top1.pct, top1.pct.recovered,
+                 top01.pct,top01.pct.recovered)) # %>%   #removes redundant columns
+  # rename('Unique TCR\u03B2 in TLS, n' = unique.TCR#, 
+  # 'Top 10% of TCR\u03B2, n' = top10.pct, 'Top 1% of TCR\u03B2, n' = top1.pct, 'Top 0.1% of TCR\u03B2, n' = top01.pct
+  # ) 
+
+df3
+df3 %>% 
+  kbl(caption = "Summary of cross-referenced TLS data (v. 3)", align = 'c') %>%
+  kable_classic(full_width=F) %>% 
+  # add_header_above(c(" " = 1, "Unique" = 2, "Top 10%" = 2, "Top 1%" = 2, "Top 0.1%" = 2)) %>% 
+  save_kable(., paste0(output.path, "summaryTable_TLS_TCRB_matching_to_singleCell_final.pdf"))
+
+df3 %>% 
+  writexl::write_xlsx(.,paste0(output.path, "summaryTable_TLS_TCRB_matching_to_singleCell_final.xlsx"))
+```
+
+# III. Analysis 
+### A. RNA-seq analysis
+#### 1. Plot FindAllMarkers output
+```{r plot_FindAllMarkers}
+hasTCR_colors = c("darkblue", "lightblue")
+names(hasTCR_colors) = c("Yes","No")
+
+cloneType_colors = rev(pals::brewer.purd(3+length(levels(seurat@meta.data$cloneType)))[4:(3+length(levels(seurat@meta.data$cloneType)))])
+names(cloneType_colors) = levels(seurat@meta.data$cloneType)
+
+TLS.present_colors = c('gray', 'gray26')
+names(TLS.present_colors) = c(0, 1)
+
+cols.use <- list(
+  active.ident=cluster_colors,
+  hasTCR = hasTCR_colors,
+  cloneType = cloneType_colors,
+  TLS.present=TLS.present_colors
+)
+
+########################
+pdf(paste0(output.path, "findAllMarkers.pdf"), width=12, height = 8)
+
+DoMultiBarHeatmap(seurat, 
+                  features = top10$gene,
+                  group.by = "active.ident",
+                  additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  additional.group.sort.by=c("hasTCR","TLS.present","cloneType"),
+                  cols.use = cols.use,
+                  label = T,
+                  size = 2,
+                  angle = 45,
+                  lines.width=3,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20))+ # Left margin
+        # legend.position="bottom")
+  NoLegend()
+dev.off()
+
+#plot top 5
+pdf(paste0(output.path, "findAllMarkers2.pdf"), width=12, height = 8)
+
+DoMultiBarHeatmap(seurat, 
+                  features = top5$gene,
+                  group.by = "active.ident",
+                 additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  additional.group.sort.by=c("hasTCR","TLS.present","cloneType"),
+                  cols.use = cols.use,
+                  label = T,
+                  size = 2,
+                  angle = 45,
+                  lines.width=3,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6.5, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20))+ #& # Left margin
+        # legend.position="bottom")
+ NoLegend()
+dev.off()
+
+pdf(paste0(output.path, "findAllMarkers3.pdf"), width=12, height = 8)
+DoMultiBarHeatmap(seurat, 
+                  features = top3$gene,
+                  group.by = "active.ident",
+                 additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  additional.group.sort.by=c("hasTCR","TLS.present","cloneType"),
+                  cols.use = cols.use,
+                  label = T,
+                  size = 2,
+                  angle = 45,
+                  lines.width=3,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6.5, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20))+ #& # Left margin
+        # legend.position="bottom")
+ NoLegend()
+dev.off()
+
+### versions of the plot without grouping of TLS expanded TCRs
+pdf(paste0(output.path, "findAllMarkers4.pdf"), width=12, height = 8)
+DoMultiBarHeatmap(seurat, 
+                  features = top10$gene,
+                  group.by = "active.ident",
+                  additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  # additional.group.sort.by=c("TLS.expanded"),
+                  cols.use = cols.use,
+                  label = T,
+                  size = 2,
+                  angle = 45,
+                  lines.width=3,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20))+ # Left margin
+        # legend.position="bottom")
+  NoLegend()
+dev.off()
+
+pdf(paste0(output.path, "findAllMarkers5.pdf"), width=12, height = 8)
+DoMultiBarHeatmap(seurat, 
+                  features = top5$gene,
+                  group.by = "active.ident",
+                   additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  # additional.group.sort.by=c("TLS.expanded"),
+                  cols.use = cols.use,
+                  label = T,
+                  size = 2,
+                  angle = 45,
+                  lines.width=3,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6.5, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20)) #& # Left margin
+        # legend.position="bottom")
+NoLegend()
+dev.off()
+ 
+pdf(paste0(output.path, "findAllMarkers6.pdf"), width=12, height = 8)
+DoMultiBarHeatmap(seurat, 
+                  features = top3$gene,
+                  group.by = "active.ident",
+                 additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  # additional.group.sort.by=c("TLS.expanded"),
+                  cols.use = cols.use,
+                  label = T,
+                  size = 2,
+                  angle = 45,
+                  lines.width=3,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6.5, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20))+ #& # Left margin
+        # legend.position="bottom")
+ NoLegend()
+dev.off()
+```
+
+#### 2. Make Volcano plots
+
+```{r}
+volc_markers <- FindAllMarkers(seurat, test.use = "MAST", #only.pos = TRUE, 
+                          # min.pct = 0.25, 
+                          # logfc.threshold = 0.25
+                          assay="SCT"
+                         # assay="RNA"
+                         # assay=obj@assay$SCT@scale.data
+                          )
+#
+saveRDS(volc_markers, file=paste0(output.path,"findAllMarkers_volc.rds"))
+# volc_markers <- readRDS(paste0(output.path,"findAllMarkers_volc.rds"))
+
+#subset to remove mitochondrial genes
+nrow(volc_markers)
+grep("MT-",volc_markers$gene)
+volc_markers$gene[grep("MT-",volc_markers$gene)]
+volc_markers = volc_markers[-grep("MT-",volc_markers$gene),]
+grep("MT-",volc_markers$gene)
+nrow(volc_markers)
+
+
+for (i in unique(volc_markers$cluster)) { 
+ res = volc_markers[volc_markers$cluster==i,] 
+ res[res$p_val_adj==0,c("p_val","p_val_adj")] <- .Machine$double.xmin #convert 0s to machine minimum for plotting
+
+ p <- EnhancedVolcano::EnhancedVolcano(res,
+    lab = res$gene, #use this rather than rowames(res)
+    selectLab = c(),
+    x = 'avg_log2FC',
+    y = 'p_val_adj',
+    xlim = c(min(res[['avg_log2FC']], na.rm = TRUE) - 1, max(res[['avg_log2FC']], na.rm = TRUE) +
+    1),
+  ylim = c(0, max(-log10(res[['p_val_adj']]), na.rm = TRUE) + 1),
+    title = paste0(i, " versus non-",i),
+    subtitle="",
+    titleLabSize = 16,
+    caption = paste0("total = ", nrow(res), " genes"),
+    pCutoff = 0.05,
+    FCcutoff = 0.5,
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pointSize = 2,
+    labSize=4,
+    labCol = 'black',
+              # legendPosition = 'right',
+                                       # col=c('grey10', 'royalblue4', 'purple4', 'red3'),
+    colAlpha = 0.8,
+    legendLabSize = 12,
+    legendIconSize = 3,
+    drawConnectors = TRUE,
+    widthConnectors = 0.8,    typeConnectors = "closed",    arrowheads = FALSE,
+    gridlines.major = FALSE, gridlines.minor = FALSE
+ ) 
+print(p) 
+  pdf(paste0(output.path,"volcano_plot_",i,".pdf"))
+  print(p)
+  dev.off()
+ 
+}
+
+####
+ res = volc_markers[volc_markers$cluster=="CD4 Tph",] 
+
+ res[res$p_val_adj==0,c("p_val","p_val_adj")] <- .Machine$double.xmin #convert 0s to machine minimum for plotting
+
+ p <- EnhancedVolcano::EnhancedVolcano(res,
+    lab = res$gene, #use this rather than rowames(res)
+    selectLab = c("CTLA4", "TOX", "MAF", "ITGB1", "TIGIT", "SLAMF6","CXCR3","CXCL13","PDCD1"
+),
+    x = 'avg_log2FC',
+    y = 'p_val_adj',
+    xlim = c(min(res[['avg_log2FC']], na.rm = TRUE) - 1, max(res[['avg_log2FC']], na.rm = TRUE) +
+    1),
+  ylim = c(0, max(-log10(res[['p_val_adj']]), na.rm = TRUE) + 1),
+    title = paste0("Tph versus non-Tph"),
+    subtitle="",
+    titleLabSize = 16,
+    caption = paste0("total = ", nrow(res), " genes"),
+    pCutoff = 0.05,
+    FCcutoff = 0.5,
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pointSize = 2,
+    labSize=4,
+    labCol = 'black',
+              # legendPosition = 'right',
+                                       # col=c('grey10', 'royalblue4', 'purple4', 'red3'),
+    colAlpha = 0.8,
+    legendLabSize = 12,
+    legendIconSize = 3,
+    drawConnectors = TRUE,
+    widthConnectors = 0.8,    typeConnectors = "closed",    arrowheads = FALSE,
+    gridlines.major = FALSE, gridlines.minor = FALSE
+ ) 
+   pdf(paste0(output.path,"volcano_plot_Tph_curatedGenes.pdf"))
+   print(p)
+   dev.off()
+   
+```
+#### 3. Plot GOI
+```{r plot_goi}
+pdf(paste0(output.path, "goi_heatmap.pdf"), width=12, height = 8)
+# project TCRs and add annotation column to heatmaps
+DoMultiBarHeatmap(seurat, 
+                  features = goi.allbutTLS, 
+                  group.by = "active.ident",
+                  additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  additional.group.sort.by=c("cloneType"),
+                  cols.use = cols.use,
+                  label = T,
+                  size = 2, 
+                  angle = 45,
+                  lines.width=5,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20))+ #& # Left margin
+        # legend.position="bottom") 
+ NoLegend()
+
+DoMultiBarHeatmap(seurat, 
+                  features = goi.allbutTLS, 
+                  group.by = "active.ident",
+                   additional.group.by = c("hasTCR","cloneType","TLS.present"
+),
+                  # additional.group.sort.by=c("TLS.expanded"),
+cols.use = cols.use,
+label = T,
+                  size = 2, 
+                  angle = 45,
+                  lines.width=5,
+                  group.bar.height=0.02,
+                  combine=T
+                  )+
+  theme(axis.text.y.left = element_text(size=6, face="italic"),
+        plot.margin = margin(t = 20,  # Top margin
+                             r = 85,  # Right margin
+                             b = 15,  # Bottom margin
+                             l = 20))+ #& # Left margin
+        # legend.position="bottom") 
+ NoLegend()
+
+dev.off()
+```
+#### 4. Feature plots, ridgePlots, vlnPlots, DotPlots
+```{r other_seurat_plots}
+#make list of FeaturePlots for each GOI
+FeaturePlot.goi <- lapply(1:length(goi.all.list), function(i) {
+  FeaturePlot(seurat, features = goi.all.list[[i]], ncol=3, combine=T)  +
+    plot_annotation(title=names(goi.all.list)[i]) &
+    theme(plot.title=element_text(size=12, face="bold")) & 
+    NoLegend() & NoAxes()
+})
+
+pdf(paste0(output.path, 
+           "featureplots.pdf"), width = 12, height = 8)    
+for (i in 1:length(FeaturePlot.goi)) {
+  plot(FeaturePlot.goi[[i]]) 
+  } 
+dev.off()
+
+#make list of ridgePlots for each GOI
+ridgePlot.goi <- lapply(1:length(goi.all), function(i) {
+  RidgePlot(seurat, features = goi.all[[i]])  
+})
+  
+pdf(paste0(output.path, 
+           "ridgeplots.pdf"), width = 12, height = 8)    
+for (i in 1:length(ridgePlot.goi)) {
+  plot(ridgePlot.goi[[i]]) 
+  } 
+dev.off()
+
+#make list of violin plots for each GOI
+vlnPlot.goi <- lapply(1:length(goi.all.list), function(i) {
+  VlnPlot(seurat, features = goi.all.list[[i]])
+})
+
+pdf(paste0(output.path, 
+           "vlnPlots.pdf"), width = 12, height = 8)    
+for (i in 1:length(vlnPlot.goi)) {
+  plot(vlnPlot.goi[[i]]) 
+  } 
+dev.off()
+
+#make list of DotPlots for each GOI
+DotPlot.goi <- lapply(1:length(goi.all.list), function(i) {
+  DotPlot(seurat, features = goi.all.list[[i]]) +
+    RotatedAxis()
+})
+
+
+
+pdf(paste0(output.path, 
+           "dotplots.pdf"), width = 12, height = 8)    
+for (i in 1:length(DotPlot.goi)) {
+  plot(DotPlot.goi[[i]]) 
+  } 
+dev.off()
+
+########################
+goi.for.pub = c("CD3E",
+  "CD4","CD8A",
+                "CCR7","SELL", 
+  "TCF7",#"IL7R",
+  "GZMK","GZMB","PDCD1", "CTLA4", 
+  "TIGIT","HAVCR2", "LAG3", 
+  "ENTPD1","CXCL13", "TOX","ZNF683",#"NR4A2",
+                "NKG7",
+                "CXCR5","CXCR3","ICOS"
+                #"FOXP3"
+                )
+#violin plots for specific markers for publication
+p1 <- VlnPlot(seurat, cols=cluster_colors,
+        features=goi.for.pub,stack=T,flip=T,fill.by='ident',pt.size=1)&NoLegend()
+p1
+pdf(paste0(output.path,"vlnPlots_goi_for_pub.pdf"),height=12,width=8);p1;dev.off()
+
+
+p2 <- DotPlot(seurat, features = goi.for.pub)+scale_x_discrete(limits = rev)+coord_flip()+theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+# p2
+pdf(paste0(output.path,"DotPlot_goi_for_pub.pdf"),height=10,width=8);p2;dev.off()
+
+goi.for.fp = c("CD3E",
+               "CD4","CD8A",
+                "CCR7",
+               "SELL", "GZMK","GZMB","NKG7",
+               "PDCD1", #"CTLA4", #"HAVCR2", #"ENTPD1",
+               "CXCL13", "TOX","ZNF683"
+                #"FOXP3"
+                )
+p3 <- FeaturePlot(seurat,features=goi.for.fp,keep.scale="all",ncol=3)+
+  plot_layout(guides="collect")+
+  theme(
+    panel.spacing = unit(0,'lines')
+  )&
+  #NoLegend()&
+  NoAxes()
+p3
+
+pdf(paste0(output.path,"FeaturePlot_goi_for_pub.pdf"),height=9,width=7
+    );p3;dev.off()
+#     
+# p4 <- RidgePlot(seurat, features = goi.for.pub[1:4],fill.by = "feature")
+# p4
+
+###############
+
+#these genes come from Rao et al 2017 Nature, commented out genes didn't show much signal in the single cell TIL dataset
+goi_for_tph = c("CD4", "PDCD1", "CXCL13", "TOX", 
+                   "CXCR5", "CXCR3", "MAF", "ICOS",
+                #   "IL21",
+                "SLAMF1"
+                   # "BCL6", 
+                   # "PRDM1", #blimp1),
+                   #"CCR2", #"CX3CR1 all cells have same expression CX3CR1",
+                   # "CCR5"
+                   )
+p4 <- VlnPlot(seurat, cols=cluster_colors,
+        features= goi_for_tph,
+        stack=T,flip=T,fill.by='ident',pt.size=1)&NoLegend()
+p4
+pdf(paste0(output.path,"vlnPlots_goi_for_tph.pdf"),height=10,width=8);p4;dev.off()
+
+p5 <- DotPlot(seurat, features = goi_for_tph)+scale_x_discrete(limits = rev)+coord_flip()+theme(axis.text.x=element_text(angle=45,hjust=1,vjust=1))
+p5
+pdf(paste0(output.path,"DotPlot_goi_for_tph.pdf"),height=10,width=8);p5;dev.off()
+
+```
+### B. Immune repertoire analysis
+#### 1. Visualize Clonal expansion on UMAP
+```{r clonalExp}
+pdf(paste0(output.path, "clonalExp.pdf"), width=10, height=8)
+
+DimPlot(seurat, group.by = "cloneType",pt.size=4)+ 
+  scale_color_manual(values=cloneType_colors)+
+  # scale_color_brewer(palette="PuRd", direction=-1) +
+  # scale_color_manual(values = rev(colorRampPalette(brewer.pal(9, "Purples"))(6)[2:6]))+
+    ggprism::theme_prism()+theme(legend.position = "right",legend.text=element_text(size=12))+
+  ggtitle("")
+
+dev.off()
+```
+#### 2. Visualize TLS TCRs on UMAP
+```{r map_adaptive_to_sc}
+#define map_adaptive function, which will be used to project onto the single cell data TCRs that either match or are expanded 
+map_adaptive <- function(x) {
+  seurat <- highlightClonotypes(seurat, 
+                                cloneCall= "aa", 
+                                sequence = x)
+  DimPlot(seurat, group.by = "highlight", pt.size=4) + 
+    NoLegend()
+}
+####################
+####################
+pdf(paste0(output.path, "map_adaptive_all.pdf"),width=7, height=7)
+#map all clones present in TLS (clone ct >= 1)
+map_adaptive(seurat.TLS$CTaa)+ 
+       labs(title = paste0("Single cells with ",
+                           ifelse(repertoire=="T", "TCR\u03b2", "IGH"),
+                         " identified in TLS", " (n = ", 
+                         length(seurat.TLS$CTaa), ")"))
+dev.off()
+
+pdf(paste0(output.path, "map_adaptive_expanded.pdf"),width=8, height=7)
+#map all clones expanded in TLS (clone ct > 1)
+map_adaptive(seurat.TLS.excludeSingletons$CTaa)+ 
+      labs(title = paste0("Expanded ", ifelse(repertoire=="T", "TCRB", "IGH"),
+                         " (count > 1) in TLS mapped onto SC ", " data (n = ", length(seurat.TLS.excludeSingletons$CTaa), ")"))
+dev.off()
+###########################
+#Plot cells present in TLS using cell.highlight
+DimPlot(seurat, pt.size=4,
+        cells.highlight =names(which(seurat$TLS.present ==1)), #split.by = "orig.ident", ncol=4, 
+        sizes.highlight=4,
+        cols.highlight="dodgerblue"
+        ) + 
+  ggtitle("All TLS TCRs (count >= 1) projected onto sc data")+
+  NoLegend()
+
+#Plot cells expanded in TLS using cell.highlight
+DimPlot(seurat, cells.highlight =names(which(seurat$TLS.expanded ==1)), split.by='orig.ident', ncol=4, sizes.highlight = 0.05) +
+  ggtitle("Expanded TLS TCRs (count > 1) projected onto sc data")+
+  NoLegend()
+dev.off()
+```
+
+#### 3. Visualize mapped clonotypes with stacked barplot
+
+```{r barplot_clonotypes, height = 7, width = 14}
+#run stackedBP script, which creates 2 functions (stackedBP and prepforBarplot) which will be used for making stacked barplots of individual clonotypes
+source("./scripts/stackedBP.R")
+
+pdf(paste0(output.path, "stackedBP.pdf"), width=12, height=10)
+
+########################
+########################
+# Now use the 2 functions defined above to create 4 pairs of objects, named such that s = seurat repertoire, t = TLS repertoires
+
+# first pair of objects from totality of seurat objects and TLS dissections. these are created from two objects,seurat.TLS and seurat.TLS.bypatient
+# 1A. s.plus.T.forBarplot
+# 1B. s.plus.T.forBarplot.bypatient
+
+# second pair of objects, where I have removed singletons from the single cell repertoires. These two are created from above objects 1A and 1B
+# 1C. s.plus.T.forBarplot.noSingletons
+# 1D. s.plus.T.forBarplot.noSingletons.bypatient
+
+#########################
+# third pair of objects, where I have removed singletons from TLS (i.e. only included expanded TLS clones). these were created from two objects
+# seurat.TLS.excludeSingletons 
+# seurat.TLS.excludeSingletons.bypatient
+
+# 2A. s.plus.T.excludeSingletons.forBarplot
+# 2B. s.plus.T.excludeSingletons.forBarplot.bypatient
+ 
+# fourth pair of objects, where I removed singletons from seurat object and removed singletons from TLS repertoires. these are created from 2A and 2B.
+# 2C. s.plus.T.excludeSingletons.forBarplot.noSingletons
+# 2D. s.plus.T.excludeSingletons.forBarplot.noSingletons.bypatient
+
+########################
+########################
+
+#Create objects 1A, 1B, 1C, 1D
+# create 1A using prepforBarplot function
+s.plus.T.forBarplot <- prepforBarplot(seurat.TLS)
+# plot 1A using stackedBP
+
+p <- stackedBP(s.plus.T.forBarplot) + 
+    ggtitle(
+      paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+             " with a matching ", 
+             ifelse(repertoire=="T", "TCRB", "IGH"),
+             " in TLS ", " all samples",
+             " (n=", 
+             sum(s.plus.T.forBarplot$count), ")"
+      )) 
+
+# create 1B using prepforBarplot function
+s.plus.T.forBarplot.bypatient <- lapply(seurat.TLS.bypatient,prepforBarplot)
+# plot 1B using stackedBP function
+spt_list <- lapply(1:length(s.plus.T.forBarplot.bypatient), function(i) {
+  stackedBP(s.plus.T.forBarplot.bypatient[[i]])+
+    ggtitle(
+      paste0(names(s.plus.T.forBarplot.bypatient[i]),
+             " (n=", 
+             sum(s.plus.T.forBarplot.bypatient[[i]]$count), ")"
+      ))
+})
+patchwork::wrap_plots(spt_list, guides="collect")+
+  plot_annotation(
+    title = paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+                   " with a matching ",
+                   ifelse(repertoire=="T", "TCRB", "IGH"),
+                   " in TLS ")
+  )& theme(legend.position = "none")
+
+#Create 1C by subsetting 1A for clones with count > 1, then plot with stackedBP function
+s.plus.T.forBarplot.noSingletons <- s.plus.T.forBarplot[s.plus.T.forBarplot$countSum>1,]
+stackedBP(s.plus.T.forBarplot.noSingletons)+
+  ggtitle(paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+                 " matching expanded ", 
+                 ifelse(repertoire=="T", "TCRB", "IGH"),
+                 " in TLS of all samples", 
+                 ", sc clone ct > 1", " (n=",
+                 sum(s.plus.T.forBarplot.noSingletons$count), ")"
+  ))
+
+#Create 1D by subsetting 1B for cloens with count > 1, then plot with stackedBP function
+s.plus.T.forBarplot.noSingletons.bypatient <- lapply(1:length(s.plus.T.forBarplot.bypatient), function(i) {
+  s.plus.T.forBarplot.bypatient[[i]][s.plus.T.forBarplot.bypatient[[i]]$countSum>1,]}) %>% `names<-`(names(s.plus.T.forBarplot.bypatient))
+
+spt_noSingletons_list <- lapply(1:length(s.plus.T.forBarplot.noSingletons.bypatient), function(i) {
+  stackedBP(s.plus.T.forBarplot.noSingletons.bypatient[[i]])+
+    ggtitle(
+      paste0(names(s.plus.T.forBarplot.noSingletons.bypatient[i]),
+             " (n=", 
+             sum(s.plus.T.forBarplot.noSingletons.bypatient[[i]]$count), ")"
+      ))
+})
+
+patchwork::wrap_plots(spt_noSingletons_list, guides="collect")+ 
+  plot_annotation(
+    title = paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+            " with a matching ",
+            ifelse(repertoire=="T", "TCRB", "IGH"),
+            " in TLS (sc clone ct > 1)")
+  ) & theme(legend.position = "none")
+
+########################### 
+#Create objects 2A-2D, which are built by excluding TLS singletons 
+#make stacked barplot for all clonotypes with clone count > 1 in  TLS that map onto peripheral sc data
+#make s.plus.T.forBarplot object, which collapses the seurat object into unique clonotypes (rather than unique cells)
+
+#2A
+s.plus.T.excludeSingletons.forBarplot <- prepforBarplot(seurat.TLS.excludeSingletons)
+
+stackedBP(s.plus.T.excludeSingletons.forBarplot) + 
+  labs(title = paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+                     " matching expanded ", 
+                     ifelse(repertoire=="T", "TCRB", "IGH"),
+                     " (clones > 1) in TLS",
+                     " (n=", length(unique(s.plus.T.excludeSingletons.forBarplot$TCRB_or_IGH)), ")"
+                     )
+  )
+
+#2B
+s.plus.T.excludeSingletons.forBarplot.bypatient <- lapply(seurat.TLS.excludeSingletons.bypatient, prepforBarplot)
+spt_excludeSingletons_list <- lapply(1:length(s.plus.T.excludeSingletons.forBarplot.bypatient), function(i) {
+  stackedBP(s.plus.T.excludeSingletons.forBarplot.bypatient[[i]])+
+    ggtitle(paste0(names(s.plus.T.excludeSingletons.forBarplot.bypatient[i])," (n=", sum(s.plus.T.excludeSingletons.forBarplot.bypatient[[i]]$count), ")"))
+})
+
+patchwork::wrap_plots(spt_excludeSingletons_list, guides="collect")+ 
+  plot_annotation(
+    title =paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+           " with a matching expanded ",
+           ifelse(repertoire=="T", "TCRB", "IGH"),
+           " (clones > 1) in TLS ")
+  ) & theme(legend.position = "none")
+
+
+#Create 2C by subsetting 2A for clones with count > 1, then plot with stackedBP function
+s.plus.T.excludeSingletons.forBarplot.noSingletons <- s.plus.T.excludeSingletons.forBarplot[s.plus.T.excludeSingletons.forBarplot$countSum>1,]
+stackedBP(s.plus.T.excludeSingletons.forBarplot.noSingletons)+
+  ggtitle(paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+                     " matching expanded ", 
+                     ifelse(repertoire=="T", "TCRB", "IGH"),
+                     " (clones > 1) in TLS",
+                     ", sc clone ct > 1", " (n=",
+                     sum(s.plus.T.excludeSingletons.forBarplot.noSingletons$count), ")"
+                     ))
+
+#Create 2D by subsetting 2B for clones with count > 1, then plot with stackedBP function
+s.plus.T.excludeSingletons.forBarplot.noSingletons.bypatient <- lapply(1:length(s.plus.T.excludeSingletons.forBarplot.bypatient), function(i) {
+  s.plus.T.excludeSingletons.forBarplot.bypatient[[i]][s.plus.T.excludeSingletons.forBarplot.bypatient[[i]]$countSum>1,]}) %>% `names<-`(names(s.plus.T.excludeSingletons.forBarplot.bypatient))
+
+spt_excludeSingletons_noSingletons_list <- lapply(1:length(s.plus.T.excludeSingletons.forBarplot.noSingletons.bypatient), function(i) {
+  stackedBP(s.plus.T.excludeSingletons.forBarplot.noSingletons.bypatient[[i]])+
+    ggtitle(
+      paste0(names(s.plus.T.excludeSingletons.forBarplot.noSingletons.bypatient[i]),
+             " (n=", 
+             sum(s.plus.T.excludeSingletons.forBarplot.noSingletons.bypatient[[i]]$count), ")"
+      ))
+})
+
+patchwork::wrap_plots(spt_excludeSingletons_noSingletons_list, guides="collect")+ 
+  plot_annotation(
+    title =paste0(ifelse(repertoire=="T", "T cells", "B cells"),
+                  " with a matching ",
+                  ifelse(repertoire=="T", "TCRB", "IGH"),
+                  " (clones > 1) in TLS",
+                  " in TLS (sc clone ct > 1)")
+ ) & theme(legend.position = "none")
+
+dev.off()
+```
+
+#### 4. Occupied repertoire
+
+```{r occupiedRepertoire}
+#prep metadata for occcupiedscRepertoire function by creating $test column in metadata, which will be used for the figure legend of the occupied repertoire function
+#note this requires changing the $clonotype column in the metadata which will be appended with the prefix "TLS present_" or "TLS absent_". This is then 'reset' at the conclusion of this code chunk
+
+occRepWrapper <- function(x) {
+  x$cloneType <- paste0(ifelse(x$TLS.present==1, "TLS present", "TLS absent"), 
+                           "_", 
+                           x$cloneType)
+  x@meta.data$cloneType <- factor(x@meta.data$cloneType, levels = c(
+  "TLS present_Hyperexpanded (100 < X <= 500)",
+  "TLS present_Large (20 < X <= 100)",
+  "TLS present_Medium (5 < X <= 20)",
+  "TLS present_Small (1 < X <= 5)",
+  "TLS present_Single (0 < X <= 1)",
+  "TLS absent_Hyperexpanded (100 < X <= 500)",
+  "TLS absent_Large (20 < X <= 100)",
+  "TLS absent_Medium (5 < X <= 20)",
+  "TLS absent_Small (1 < X <= 5)",
+  "TLS absent_Single (0 < X <= 1)", NA))
+
+  TLS_clonetype_col = c(brewer.pal(6, "Blues")[6:2], brewer.pal(6, "Reds")[c(6:2)])
+  names(TLS_clonetype_col) = levels(x@meta.data$cloneType)
+  p1 <- occupiedscRepertoire(x, label=F, x.axis = "ident", proportion=T) + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    theme(legend.title=element_blank(),legend.position="right")
+  set_palette(p1, TLS_clonetype_col)
+}
+
+pdf(paste0(output.path, "occRep.pdf"))
+occRepWrapper(seurat)+ggtitle("All Patients")
+#make plot of occRep by patient (single patient plots, assembled as patchwork)
+if (length(unique(seurat$Patient))>1) {
+  occRep.by.patient <- lapply(1:length(unique(seurat$Patient)), function(i) {
+    temp <- subset(x = seurat, subset = Patient == unique(seurat$Patient)[i])
+    occRepWrapper(temp)+ggtitle(unique(seurat$Patient)[i])
+  })
+  patchwork::wrap_plots(occRep.by.patient, guides="collect") & theme(legend.position = "none")
+} 
+dev.off()
+```
+
+### C. Calculate stats for clonal expansion
+
+#### 1. fisher's exact test for clonal expansion
+```{r}
+#do fisher's exact test for association between T cell subsets and clonal expansion
+#CD8 TEM vs non-CD8 TEM, expanded (defined as clone count >2) vs non expanded (clone count 1-2)
+fisher.df = select(seurat@meta.data, c(Frequency, hasTCR, active.ident,cloneType)) %>% 
+  #subset for only the cells with a TCR
+  filter(hasTCR=="Yes") %>%
+  # create expansion column, which is binary categorical variable where expanded = frequency > 5 and nonexpanded = frequency 1-5
+  mutate(expansion = case_when(Frequency > 2 ~ "Expanded", 
+
+                               .default= "Non-Expanded"))  
+fisher.df
+OR_table = c()
+for (i in unique(fisher.df$active.ident)) {  
+    # create simplified cluster column 
+  # mutate(CD8binary = case_when(active.ident == "Treg" ~ "Treg",  # .default="Non-Treg"))
+  temp <- fisher.df %>% mutate(binary = case_when(active.ident == i# %in% c("CD8 TEM"#, "CD8 TEM", "CD8 Proliferating"
+                                                 ~ i,
+                                                 .default=paste0("Non-", i)))#CD8"))
+# table(fisher.df$active.ident, fisher.df$expansion)
+  two_by_two = table(temp$binary, temp$expansion) 
+  test <- fisher.test(two_by_two)
+  # test <- table(temp$CD8binary, temp$expansion) %>% fisher.test
+  # mosaicplot(dat,
+  #          main = "Mosaic plot",
+  #          color = TRUE)
+# chisq.result <- chisq.test(dat)
+# chisq.test(dat)
+  # test <- fisher.test(dat)
+#return odds ratio
+  OR_table = c(OR_table, c(i, 
+                           ifelse(test$p.value < 0.001, "< 0.001",
+                                  round(test$p.value, 3)),
+                           round(as.numeric(test$estimate),2),
+                           round(test$conf.int,2)
+                           ))
+  # print(i)
+  # print(test$estimate)
+}
+OR_table = as.data.frame(matrix(OR_table,ncol =5,byrow = T)) 
+colnames(OR_table) <- c("Cluster", "p-value","OR", "95%_CI_Lower","95%_CI_Upper")
+OR_table$OR =as.numeric(OR_table$OR)
+OR_table = arrange(OR_table,desc(OR))
+OR_table
+write.csv(OR_table, paste0(output.path, "fisher_exact_test_clonal_expansion_greater_than_2_clones_by_cluster.csv"), row.names = F)
+
+```
+
+#### 2. fisher's exact test for cluster association w/ TLS
+
+```{r}
+# CD8 vs non-other
+fisher.df = select(seurat@meta.data, c(hasTCR, active.ident,TLS.present)) %>%
+  #subset for only the cells with a TCR
+  filter(hasTCR=="Yes")
+nrow(fisher.df)
+fisher.df$TLS.present <- factor(fisher.df$TLS.present, levels=c(0,1), labels=c("TLS absent","TLS present"))
+table(fisher.df$active.ident,fisher.df$TLS.present)
+fisher.df
+OR_table = c()
+for (i in unique(fisher.df$active.ident)) {
+    # create simplified cluster column
+  # mutate(CD8binary = case_when(active.ident == "Treg" ~ "Treg",  # .default="Non-Treg"))
+  temp <- fisher.df %>% mutate(binary = case_when(active.ident == i# %in% c("CD8 TEM"#, "CD8 TEM", "CD8 Proliferating"
+                                                 ~ i,
+                                                 .default=paste0("Non-", i)))#CD8"))
+# table(fisher.df$active.ident, fisher.df$expansion)
+  dat <- table(temp$TLS.present,temp$binary)#
+  test <- fisher.test(dat)
+  # test <- table(temp$CD8binary, temp$expansion) %>% fisher.test
+  # mosaicplot(dat,
+  #          main = "Mosaic plot",
+  #          color = TRUE)
+# chisq.result <- chisq.test(dat)
+# chisq.test(dat)
+  # test <- fisher.test(dat)
+#return odds ratio
+  OR_table = c(OR_table, c(i,
+                           ifelse(test$p.value < 0.001, "< 0.001",
+                                  round(test$p.value, 3)),
+                           round(as.numeric(test$estimate),2),
+                           round(test$conf.int,2)
+                           ))
+  # print(i)
+  # print(test$estimate)
+}
+OR_table = as.data.frame(matrix(OR_table,ncol =5,byrow = T))
+colnames(OR_table) <- c("Cluster", "p-value","OR", "95%_CI_Lower","95%_CI_Upper")
+OR_table$OR <- as.numeric(as.character(OR_table$OR))
+OR_table = arrange(OR_table,desc(OR))
+OR_table
+write.csv(OR_table, paste0(output.path, "fisher_exact_test_TLS_presence_vs_cluster.csv"), row.names = F)
+
+```
+
+# VI. Plot TLS composition by cluster
+### A. change cluster colors
+
+```{r}
+  cluster_colors=c(cluster_colors, "lightgray")
+  names(cluster_colors)[length(cluster_colors)] <- "unmatched" #name last item, "lightgray", as unmatched
+  levels(cluster_colors) = cluster_colors
+  cluster_colors
+```
+
+### B. Plots for OT6 
+Combine data from TIL and PBMC. In cases where a transcriptional phenotype was assigned for shared TCRs in both TIL and PBMC, TIL identity was selected. 
+if no match in TIL, PBMC phenotype was used.
+
+```{r TLS_composition, eval=T}
+seurat.pbmc.OT6 <- readRDS(paste0(
+  str_replace(output.path, "til", "pbmc"),
+  "seurat_pbmc_azimuth_l3_OT6.rds"))
+
+#####################################################
+source("scripts/TLS_composition_plot.R") #load TLS-compoisition function
+
+### make figures for all patients but OT6
+patients <- "OT6" #adaptiveTLS$meta$Patient.ID %>% unique
+
+for(i in 1:length(patients)) {
+TLS_composition_til_pbmc(query=patients[i],seurat_obj_TIL=seurat,seurat_obj_PBMC=seurat.pbmc.OT6)
+}
+```
+
+### C. Plot TLS composition using all samples (both PBMC + TIL) 
+```{r}
+
+# adaptiveTLS_all <- readRDS("C:/Users/dshu2/Documents/GitHub/HCC_TLS/output/adaptive/TCRB/HCC_immdata_TLS_TCRB_final_for_seurat.rds")
+adaptiveTLS_all <- readRDS("output/adaptive/TCRB/HCC_immdata_TLS_TCRB_final_for_seurat.rds")
+
+seurat.pbmc <- readRDS("./output/single_cell/T_pbmc_azimuth_l3/seurat_post_addition_of_TCR.rds")
+### Make summary figure for all patients
+#### note this uses code from the first part of the TLS_composition function, to create a list object all, which has all of the TCR data for each TLS collapsed
+
+# patients= adaptiveTLS_all$meta$Patient.ID %>% unique
+
+
+  #  meta_subset = adaptiveTLS_all$meta[grep(i, adaptiveTLS_all$meta$Sample),]
+  # TLS_sampNames <- meta_subset$Sample
+  #   list <- adaptiveTLS_all$data[TLS_sampNames]
+  meta_subset = adaptiveTLS_all$meta
+  TLSrep <- bind_rows(adaptiveTLS_all$data,.id="TLS") %>% select(TLS, Clones, Proportion, CDR3.nt, CDR3.aa,
+                                                                 V.name, D.name,J.name
+                                                                )  %>% mutate(Patient = str_replace(TLS, "-.*", ""),.before=TLS)
+    
+  TLSrep %>% head
+    TLSrep %>% group_by(TLS) %>% summarise(total_proportion=sum(Proportion)) #this shows that the Proportion column doesnt add up to 100%, because non-productive sequences have been excluded, so we have to make a new one based on Clones column
+    TLSrep = TLSrep %>% group_by(TLS) %>% mutate(new_prop = Clones/sum(Clones)) %>% ungroup()
+    TLSrep %>% group_by(TLS) %>% summarise(total_new_prop = sum(new_prop)) #creates new proportion column, doublechecks that this adds up to 100 by TLS now
+    TLSrep %>% head #look at new_prop, which should be slightly higher than Proportion
+    TLSrep = select(TLSrep, -Proportion) %>% rename(., Proportion = new_prop) #drops old Proportion then renames new one as Proportion
+    TLSrep %>% head
+    #####################################################
+    # define function to build single cell table
+    scRep_maker <- function(seurat_obj){ 
+      scRep <- seurat_obj@meta.data %>% #filter(Patient==i) %>% 
+        select(Patient, active.ident, TCRB_or_IGH, TCRB_or_IGH2)
+      scRep <- mutate_all(scRep, funs(replace(., .=='NA', NA))) # some TCRB_or_IGH have character string "NA" rather than NA, so change these to form that is.na will recognize and omit
+    nrow(scRep)
+    # scRep$TCRB_or_IGH %>% is.na() %>% table
+    
+    #remove rows with NA in TCRB_or_IGH or TCRB_or_IGH2
+    scRep.dropNA <- scRep[!with(scRep,is.na(TCRB_or_IGH)&is.na(TCRB_or_IGH2)),]
+    # scRep.dropNA$TCRB_or_IGH %>% is.na() %>% table
+    nrow(scRep)
+    # scRep.dropNA %>%  group_by(TCRB_or_IGH, active.ident) %>% summarise(TCRB_or_IGH_n = n()) %>% View
+    
+    scRep.dropNA.summarised <- scRep.dropNA %>%  group_by(Patient,TCRB_or_IGH, active.ident) %>% summarise(TCRB_or_IGH_n = n()) %>% ungroup()
+    
+    scRep.dropNA.summarised.wider <- scRep.dropNA.summarised %>% pivot_wider(., names_from = active.ident, values_from = TCRB_or_IGH_n)
+    # scRep.dropNA.summarised.wider$subsets = rowSums( !is.na(scRep.dropNA.summarised.wider[,3:ncol(scRep.dropNA.summarised.wider)]))
+        scRep.dropNA.summarised.wider$subsets = rowSums( !is.na(scRep.dropNA.summarised.wider[,names(scRep.dropNA.summarised.wider) %in% unique(scRep$active.ident)]))
+
+    # scRep.dropNA.summarised.wider %>% View
+    scRep_final = scRep.dropNA.summarised.wider %>% 
+      # group_by(TCRB_or_IGH) %>% summarise_each((funs(sum))) %>% 
+      # mutate(top_r=apply(.[,3:(ncol(.)-1)], 1, function(x) names(x)[which.max(x)]))
+    mutate(top_r=apply(.[,names(.) %in% unique(scRep$active.ident)], 1, function(x) names(x)[which.max(x)]))
+
+    return(scRep_final)
+    } #note we lose granularity here in collapsing these different subsets
+    scRep_final <- scRep_maker(seurat)
+    scRep_final$top_r = paste0(scRep_final$top_r,"_TIL") 
+
+    scRep2_final <- scRep_maker(seurat.pbmc)
+    scRep2_final$top_r = paste0(scRep2_final$top_r,"_PBMC")
+
+    ####################################################
+    #make df by joining the two objects above (TLS data and single cell data)
+   #make df by joining the two objects above (TLS data and single cell data)
+  df_TLS_TIL <- left_join(TLSrep, select(scRep_final, c(Patient,TCRB_or_IGH,top_r)),by=c("Patient" = "Patient", "CDR3.aa" = "TCRB_or_IGH")) %>% 
+      rename(top_r_TIL = top_r)
+  df <- left_join(df_TLS_TIL, select(scRep2_final, c(Patient, TCRB_or_IGH,top_r)), by=c("Patient" = "Patient","CDR3.aa" = "TCRB_or_IGH")) %>% 
+    rename(top_r_PBMC = top_r)
+
+    #next we need to make a final top_r column, by preferentially taking TIL phenotype first, and if that isn't available take PBMC phenotype
+  df$top_r = 
+    if_else(!is.na(df$top_r_TIL)==T, 
+            df$top_r_TIL,
+            if_else(!is.na(df$top_r_PBMC)==T,
+                    df$top_r_PBMC,
+                    "unmatched"))
+  
+  #now remove suffixes for sake of more simplified plots
+  df$top_r = str_replace(df$top_r, "_PBMC|_TIL","")
+  # df$top_r %>% table
+  # df$top_r %>% table %>% sum
+  
+  df$top_r <- factor(x=df$top_r, levels=c(as.character(levels.manual), "unmatched"))
+    
+    df$expanded = if_else(df$Clones==1, "singleton", "expanded")
+    df$known = if_else(df$top_r == "unmatched", 0, 1)
+    #add TLS_type data by pulling from metadata, since TLS / Sample columns are unique, don't need to add Patient
+    df = merge(df,meta_subset[,c("Sample","TLS_type")], by.x="TLS",by.y="Sample") 
+    # df$TLS = df$TLS %>% str_replace("-T_TCRB","")
+    df$Patient = factor(df$Patient, levels =  c("P02","P03","P07","P08","P12","OT1","OT6"))
+################################################################
+###################### now make plots ##########################
+    # 
+    df.expanded = df[df$expanded=="expanded",]
+    df.expanded = df.expanded %>% group_by(Patient,TLS) %>% mutate(id = row_number()) %>% ungroup()
+    # 
+    # 
+      ##################    
+    ### FIGURE 5, all samples 
+    all_df=df[!df$top_r %in% ("unmatched"),] %>%  #another iteration, drop the unmatched and plot all knowns, expanded or not expanded
+      group_by(Patient,top_r) %>% 
+    summarise(Proportion_sum=sum(Proportion),
+              Clones_sum=sum(Clones))
+
+p <- ggplot(all_df, aes(fill=top_r, y=Clones_sum, x=Patient)) + 
+  geom_bar(position="fill", stat="identity",color="white")+
+  scale_fill_manual(values=c(cluster_colors))+
+  labs(x = "Patient", y = "Proportion (%)") +
+  # theme_void()+
+  ggprism::theme_prism()+
+  theme(axis.text.x = element_text(angle=0),
+        axis.ticks.x = element_blank(),
+        # axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        strip.background = element_blank(),
+        strip.text=element_text(face="bold")#,
+        # legend.title = element_blank(),legend.text=element_text(face="bold")
+  )+
+  coord_cartesian(clip="off")+
+  labs(title=paste0("Phenotype of TCR\u03B2 in TLS inferred by\n  matching with single cell data"),
+          caption="*OT6 matched with TIL and PBMC"
+       )+
+  # guides(fill=guide_legend(title=""))+
+  scale_y_continuous(labels = scales::percent_format(suffix=""))
+p
+
+pdf(paste0(output.path,"TLS_composition_plot_all_TIL_and_PBMC.pdf"))
+p
+dev.off()
+
+### make plot comparing phenotypes in mature vs involuted
+ TLS_df=df[!df$top_r %in% ("unmatched"),] %>%  #another iteration, drop the unmatched and plot all knowns, expanded or not expanded
+   filter(Patient %in% c("P12","OT1","OT6")) %>%
+      group_by(TLS_type,top_r) %>%
+    summarise(Proportion_sum=sum(Proportion),
+              Clones_sum=sum(Clones)) %>% ungroup()
+
+  p<-ggplot(TLS_df, aes(x = TLS_type, y=Proportion_sum, fill=top_r))+
+    geom_bar(position="fill", stat="identity",color="white")+
+    scale_fill_manual(values=cluster_colors)+
+    scale_y_continuous(expand = c(0.01,0.01),labels=scales::percent_format(suffix=""))+
+    ggprism::theme_prism()+
+    ggtitle(paste0("Inferred phenotype of TCR\u03B2 \nin TLS"))+
+      theme(axis.text.x = element_text(angle=45, hjust=1, vjust=1),
+            title=element_text(hjust=0.5))+
+    xlab("TLS type")+ylab("Proportion (%)")+
+    guides(fill=guide_legend(ncol=1))
+
+  pdf(paste0(output.path,"TLS_composition_plot_Mature_Involuted_P12_OT1_OT6.pdf"),width=5)
+  print(p)
+  dev.off()
+  
+#export df object for downstream cloning code
+saveRDS(df,paste0(output.path,"all_TIL_and_PBMC_identities_final.rds"))  
+```
+
+# VII. what % of cells that had TCR were detect in TLS
+
+```{r}
+summary_by_cluster <- seurat@meta.data[seurat@meta.data$hasTCR=="Yes",] %>% 
+  group_by(active.ident,TLS.present) %>% summarise(n=n()) %>% ungroup() %>% 
+  group_by(active.ident) %>% mutate(total = sum(n)) %>% 
+  mutate(pct = (n/total) * 100)
+summary_by_cluster$pct=signif(summary_by_cluster$pct,2)
+summary_by_cluster$n_pct = paste0(summary_by_cluster$n," \n (",summary_by_cluster$pct,"%)")
+
+summary_by_cluster$TLS.present = factor(summary_by_cluster$TLS.present, levels=c(1,0), label=c("Yes", "No")) 
+
+summary_by_cluster
+
+pdf(paste0(output.path,"matched_TCRs_by_single_cell_cluster.pdf"))
+ggplot(summary_by_cluster,aes(x=active.ident, y= n, fill=TLS.present#,label=paste0(pct,"%")
+                              ))+
+  geom_bar(position="stack",stat="identity",color="white")+
+  # scale_fill_discrete(name = "Present In TLS")+
+  ggsci::scale_fill_aaas(alpha=0.9,name = "Present In TLS")+
+  xlab("Cluster")+ylab("Single cells")+
+  # scale_y_continuous(labels = scales::percent)+
+  # geom_text(size = 3, position = position_stack(vjust = 0.5), color="white")+
+  ggtitle("TIL single cell clusters associated with TLS")+
+  ggprism::theme_prism()+
+    theme(axis.text.x = element_text(angle=45,hjust=1,vjust=1),
+          legend.title = element_text())
+
+dev.off()
+
+pdf(paste0(output.path,"matched_TCRs_by_single_cell_cluster_fill.pdf"))
+ggplot(summary_by_cluster,aes(x=active.ident, y= n, fill=TLS.present#,label=paste0(pct,"%")
+                              ))+
+  geom_bar(position="fill",stat="identity",color="white")+
+  ggsci::scale_fill_aaas(alpha=0.9,name = "Present In TLS")+
+  xlab("Cluster")+ylab("Proportion (%)")+
+  scale_y_continuous(labels = scales::percent_format(suffix=""))+
+  # geom_text(size = 3, position = position_fill(vjust = 0.5), color="white")+
+  ggtitle("TIL single cell clusters associated with TLS")+
+  ggprism::theme_prism()+
+    theme(axis.text.x = element_text(angle=45,hjust=1,vjust=1),
+          legend.title = element_text())
+dev.off()
+```
+
+#VIII. Check correlation of TCR phenotype in single cells with shared TCR in TIL and PBMC
+### a. Load data
+```{r subset patient, echo=T}
+# PBMC <- read_csv("Data/seurat_pbmc_az_l2_metadata_for_kayla.csv")
+# OT6 <- PBMC %>% filter(PBMC$Patient == "OT6")
+OT6 <- seurat.pbmc.OT6@meta.data
+
+#View(OT6)
+TIL <- seurat@meta.data
+#view(TIL)
+
+```
+### b. Transform data
+#### 1. TIL data prep
+```{r combining datasets; TIL prep}
+# TilRep <- TIL %>% filter(Patient=="OT6") %>% select(active.ident, TCRB_or_IGH)
+TilRep <- TIL %>% filter(Patient=="OT6") %>% select(active.ident, TCRB_or_IGH) 
+
+#note here we do not bring along the column TCRB_or_IGH2; I manually checked Tilrep and PbmcRep, and none of the CDR3aa sequences in TilRep$TCRB_or_IGH2 or PbmcRep$TCRB_or_IGH2 were present in the other
+#here is the code
+# seurat.pbmc.OT6@meta.data$TCRB_or_IGH2[!is.na(seurat.pbmc.OT6@meta.data$TCRB_or_IGH2)] %in% c(seurat@meta.data$TCRB_or_IGH, seurat@meta.data$TCRB_or_IGH2)
+# seurat@meta.data$TCRB_or_IGH2[!is.na(seurat@meta.data$TCRB_or_IGH2)] %in% c(seurat.pbmc.OT6@meta.data$TCRB_or_IGH, seurat.pbmc.OT6@meta.data$TCRB_or_IGH2)
+
+TilRep <- mutate_all(TilRep, funs(replace(., .=='NA', NA)))
+# some TCRB_or_IGH have character string "NA" rather than NA, so change these to form that is.na will recognize and omit
+TilRep$TCRB_or_IGH %>% is.na() %>% table
+
+#remove rows with NA in TCRB_or_IGH
+TilRep.dropNA <- TilRep %>% drop_na(TCRB_or_IGH)
+TilRep.dropNA$TCRB_or_IGH %>% is.na() %>% table
+
+#summarize
+TilRep.dropNA.summarised <- TilRep.dropNA %>%  group_by(TCRB_or_IGH, active.ident) %>% 
+  summarise(TCRB_or_IGH_n = n())
+TilRep.dropNA.summarised.wider <- TilRep.dropNA.summarised %>% pivot_wider(., names_from = 
+    active.ident, values_from = TCRB_or_IGH_n) 
+# View(TilRep.dropNA.summarised.wider)
+TilRep.dropNA.summarised.wider$subsets = rowSums(
+  !is.na(TilRep.dropNA.summarised.wider[,2:ncol(TilRep.dropNA.summarised.wider)]))
+TilRep_final = TilRep.dropNA.summarised.wider %>%group_by(TCRB_or_IGH) %>%
+  summarise_each((funs(sum))) %>%mutate(top_r=apply(.[,2:(ncol(.)-1)], 1, function(x) 
+  names(x)[which.max(x)]))
+```
+#### 2. PBMC prep
+```{r combining datasets; PBMC prep}
+PbmcRep <- OT6 %>% select(active.ident, TCRB_or_IGH,TCRB_or_IGH2)
+PbmcRep.summarised <- PbmcRep %>%  group_by(TCRB_or_IGH, active.ident) %>% 
+  summarise(TCRB_or_IGH_n = n())
+PbmcRep.summarised.wider <- PbmcRep.summarised %>% pivot_wider(., names_from =
+  active.ident, values_from = TCRB_or_IGH_n)
+#View(PbmcRep.summarised.wider)
+PbmcRep.summarised.wider$subsets = rowSums(
+    !is.na(PbmcRep.summarised.wider[,2:ncol(PbmcRep.summarised.wider)]))
+PbmcRep_final = PbmcRep.summarised.wider %>%group_by(TCRB_or_IGH) %>%
+    summarise_each((funs(sum))) %>%mutate(top_r=apply(.[,2:(ncol(.)-1)], 1, function(x) 
+    names(x)[which.max(x)]))
+```
+#### 3. Combine TIL and PBMC for extended data
+```{r}
+#export table
+pbmc_counts <- PbmcRep %>%  group_by(TCRB_or_IGH) %>% 
+  summarise(n_peripheral = n())
+til_counts <- TilRep.dropNA %>% group_by(TCRB_or_IGH) %>% 
+  summarise(n_TIL = n())
+
+inner_join(pbmc_counts, 
+      til_counts,
+      by = "TCRB_or_IGH") %>% 
+  rename("TCR\u03B2 CDR3aa" = TCRB_or_IGH) %>% 
+writexl::write_xlsx(paste0(output.path,"scatterpie_tcrb_counts_PBMC_counts_TIL.xlsx"))
+```
+## c. Combining datasets
+```{r overlapping datasets}
+#Til_in_PBMC <- TilRep_final[TilRep_final$TCRB_or_IGH %in% 
+  #  PbmcRep_final$TCRB_or_IGH,]
+##View(Til_in_PBMC)
+#PBMC_in_Til <- PbmcRep_final[PbmcRep_final$TCRB_or_IGH %in% TilRep_final$TCRB_or_IGH]
+overlap.inner <- inner_join(TilRep_final, PbmcRep_final, by = "TCRB_or_IGH", suffix=c(".TIL", ".PBMC"))
+# overlap.inner = overlap.inner[nrow(overlap.inner):1,]
+#View(overlap.inner)
+
+overlap.inner.small <- overlap.inner %>% select(.,TCRB_or_IGH,
+                                                top_r.TIL,subsets.TIL,
+                                                top_r.PBMC,subsets.PBMC)
+
+```
+## d. Make Scatterpie plots
+```{r format data for scatterpie}
+# pdf("Output/TIL_PBMC_expansion_scatterpie.pdf")
+Til_overlap_inner <- overlap.inner[,c(1,grep("TIL",names(overlap.inner)))] #extract TCRB column plus all TIL columns
+colnames(Til_overlap_inner)<-gsub(".TIL","",colnames(Til_overlap_inner))
+Til_overlap_inner$type = "TIL"
+#view(Til_overlap_inner)
+PBMC_overlap_inner <- overlap.inner[,c(1,grep("PBMC",names(overlap.inner)))] #extract TCRB column plus all PBMC columns
+colnames(PBMC_overlap_inner)<-gsub(".PBMC","",colnames(PBMC_overlap_inner))
+PBMC_overlap_inner$type = "PBMC"
+#view(PBMC_overlap_inner)
+Til_PBMC_overlap_list <- rbind(Til_overlap_inner, PBMC_overlap_inner)
+#view(Til_PBMC_overlap_list)
+
+#### lat long assignment
+Til_PBMC_overlap_list$long = c(1:16, 1:16)
+# Til_PBMC_overlap_list$long <- Til_PBMC_overlap_list$long
+# View(Til_PBMC_overlap_list )
+Til_PBMC_overlap_list$lat = if_else(Til_PBMC_overlap_list$type == "TIL", 2, 1) #adds column lat with 2 for TIL, 1 for PBMC
+Til_PBMC_overlap_list$region <- 1:nrow(Til_PBMC_overlap_list) #adds region column, numbered 1:nrow
+Til_PBMC_overlap_list[is.na(Til_PBMC_overlap_list)] <-0 #turns all NA to 0
+
+#make object subset_names for all the subsets represented by extracting columns 2:12
+subset_names<-colnames(Til_PBMC_overlap_list)[2:12] 
+subset_names = subset_names[order(match(subset_names,names(cluster_colors)))]
+Til_PBMC_overlap_list$total <- rowSums(cbind(
+    Til_PBMC_overlap_list[[2]],
+    Til_PBMC_overlap_list[[3]],
+    Til_PBMC_overlap_list[[4]],
+    Til_PBMC_overlap_list[[5]],
+    Til_PBMC_overlap_list[[6]],
+    Til_PBMC_overlap_list[[7]],
+    Til_PBMC_overlap_list[[8]],
+    Til_PBMC_overlap_list[[9]],
+    Til_PBMC_overlap_list[[10]],
+    Til_PBMC_overlap_list[[11]],
+    Til_PBMC_overlap_list[[12]]
+  ))
+Til_PBMC_overlap_list$radius <- sqrt(Til_PBMC_overlap_list$total)/8
+
+pdf(paste0(output.path,"scatterpie_final.pdf"),width=10,height=7)
+expansion_scatterpie <- ggplot() + geom_scatterpie(aes(x=long, y=lat, 
+          group=region, r=radius), 
+          data=Til_PBMC_overlap_list, cols=subset_names) +
+  coord_equal()+
+  scale_x_continuous(breaks=c(1:16),
+                     labels=Til_PBMC_overlap_list$TCRB_or_IGH[1:16])+ 
+  scale_y_continuous(breaks = c(1,2), 
+                     label = c("PBMC", "TIL")) +
+  theme_classic()+
+  # ggprism::theme_prism(base_size = 10)+
+  theme(axis.text.x = element_text(size=10, angle=45, hjust=1, vjust=1,),
+        # legend.title = element_text(face="bold"),
+        legend.key.height = unit(0.5, 'cm'),
+        legend.key.width = unit(0.5, 'cm'),
+        legend.text = element_text(size=10),
+        legend.position="top"
+        ) + 
+          xlab("TCR\u03B2 CDR3aa") + ylab("")+
+  scale_fill_manual(values=cluster_colors)+
+  guides(fill=guide_legend(""))
+
+expansion_scatterpie
+dev.off()
+
+pdf(paste0(output.path,"scatterpie_final_vert.pdf"),width=5,height=10)
+expansion_scatterpie <- ggplot() + geom_scatterpie(aes(x=long, y=lat, 
+          group=region, r=radius), 
+          data=Til_PBMC_overlap_list, cols=subset_names) +
+  coord_equal()+
+  scale_x_reverse(breaks=c(1:16),
+                     labels=Til_PBMC_overlap_list$TCRB_or_IGH[1:16])+ 
+  scale_y_continuous(breaks = c(1,2), 
+                     label = c("PBMC", "TIL")) +
+  coord_flip()+
+  ggprism::theme_prism(base_size = 10)+
+  theme(axis.text.x = element_text(size=10, angle=45, hjust=1, vjust=1,)) + 
+          xlab("TCR\u03B2 CDR3aa") + ylab("")+
+scale_fill_manual(values=cluster_colors)
+
+expansion_scatterpie
+dev.off()
+```
+
+# IX. Session Info
+```{r sessioninfo}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_scRNA-TCR_TIL.txt")
+```
+

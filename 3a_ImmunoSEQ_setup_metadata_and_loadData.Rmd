@@ -1,0 +1,129 @@
+---
+title: "Metadata creation"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# I. Load libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(kableExtra)
+
+data_dir = "data/adaptive/"
+output.path = "output/adaptive/"
+#creates output.path directory if not already present
+ifelse(!dir.exists(output.path), dir.create(output.path), paste0(output.path, " ", "directory already exists"))
+```
+
+# II. Create common metadata object for all samples 
+
+```{r}
+#create metadata dataframe using adaptive filenames
+df = data.frame(Sample = list.files(path=data_dir, pattern=".tsv") %>% str_replace(".tsv", "")) 
+df$Patient.ID = df$Sample %>% str_replace("-.*|_PBMC.*|_Biopsy.*", "")
+df$time_point = if_else(grepl(("Pre|Biopsy"), df$Sample), "Pre", "Post") 
+df$repertoire = ifelse(endsWith(df$Sample, "TCRB"), "TCRB", "IGH")
+df$type = if_else(grepl("Biopsy", df$Sample), "Biopsy", 
+                  if_else(grepl("PBMC", df$Sample), "PBMC",
+                          if_else(grepl("TDLN", df$Sample), "TDLN", "TLS")))
+df$label = df$Sample %>% gsub("-T_TCRB$|_TCRB$|-B$", "", .) 
+```
+
+### b. Add histological metadata based on CD20 and CD21 staining
+
+```{r}
+meta_hist = read_delim("data/metadata_histology_pub.txt", show_col_types = FALSE)
+meta_hist=rename(meta_hist, label = TLS) #rename TLS column to 'label', which will be used for joining, 
+
+df_hist = df[df$type=="TLS",] %>% select(.,label) %>% unique()
+df_hist= left_join(df_hist, meta_hist, by='label')
+
+#add df_hist
+df = left_join(df,df_hist, by='label')
+```
+
+### c. Add clinical metadata from Bulk RNAseq analysis
+
+```{r}
+metadata_clinical <- readRDS("output/sampInfo.rds") 
+#subset for neoadjuvant treated
+metadata_clinical = metadata_clinical[metadata_clinical$group=="Neoadjuvant",]
+
+ #subset out metadata that I don't need to include in analysis
+desired <- c('Publication.ID', 'Age', 'Sex', 'Treatment', 'Response', 'Response.2', 'Relapse', 'Death', 'Etiology', 'Prior.HBV', 'Prior.HCV', 'Histologic.grade')
+metadata_clinical <- metadata_clinical %>% select(all_of(desired))
+metadata_clinical
+colnames(metadata_clinical) == desired #check that we got columns we wanted 
+
+#change metadata_clinical to remove 0s and 1s
+metadata_clinical$Sex <- 
+  factor(metadata_clinical$Sex, levels=c(1,0),
+         labels=c("Male", 
+                  "Female"))
+metadata_clinical$Relapse <- 
+  factor(metadata_clinical$Relapse, levels=c("Yes","No"),
+         labels=c("Relapse", 
+                  "No_relapse"))
+metadata_clinical$Death <- 
+  factor(metadata_clinical$Death, levels=c(1,0),
+         labels=c("Dead", 
+                  "Alive"))
+metadata_clinical$Prior.HBV <- 
+  factor(metadata_clinical$Prior.HBV, levels=c(1,0),
+         labels=c("Prior_HBV", 
+                  "No_Prior_HBV"))
+metadata_clinical$Prior.HCV <- 
+  factor(metadata_clinical$Prior.HCV, levels=c(1,0),
+         labels=c("Prior_HCV", 
+                  "No_Prior_HCV"))
+
+#join to df
+df = left_join(df, metadata_clinical, by = c("Patient.ID"= "Publication.ID"))
+```
+
+### d. create myLabels object and add columns with publication labels
+```{r}
+#add consecutive group number, code from https://statisticsglobe.com/assign-unique-id-for-each-group-in-r
+df$Location = factor(df$Location, levels=c("Intratumoral", "Peritumoral", "Adjacent Normal"))
+df$TLS_type = factor(df$TLS_type, levels=c("Mature", "Involuted"))
+
+
+myLabels = select(df, "label", "Patient.ID", "TLS_type", "Location") %>% distinct()
+myLabels = myLabels %>% arrange(.,Patient.ID, TLS_type, Location, label) %>%
+  group_by(Patient.ID) %>%
+
+# add Order column for use with immunarch
+  mutate(Order=row_number())
+ 
+# #reverse order column for pre and post PBMC (due to alphabetical ordering, the pre-treatment is currently n+1 compared to posttreatment, I want the pre-treatment to have n-1 posttreatment)
+myLabels[grep("PBMC_Pre", myLabels$label),]$Order =  myLabels[grep("PBMC_Pre", myLabels$label),]$Order-1
+myLabels[grep("PBMC_Post", myLabels$label),]$Order =  myLabels[grep("PBMC_Post", myLabels$label),]$Order+1
+# 
+myLabels = arrange(myLabels, Patient.ID, Order)
+
+df = merge(df,myLabels[,c("label", "Order")], by="label")
+
+df = arrange(df, Patient.ID, Order)
+```
+
+### e. export final metadata file to data folder
+
+```{r}
+write.table(df, file = paste0(data_dir,"metadata.txt"), quote=F, sep = "\t",
+            row.names = F, col.names = T)
+```
+
+# III. SessionInfo
+
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_ImmunoSEQ_setup_metadata_and_loadData.txt")
+```
+

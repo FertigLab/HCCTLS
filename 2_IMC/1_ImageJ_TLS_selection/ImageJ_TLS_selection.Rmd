@@ -1,0 +1,36 @@
+---
+title: "ImageJ_TLS_selection"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(readxl)
+```
+
+```{r}
+#create data frame containing samples names and area, then export as R object
+df <- read_csv("data/TLS_selection_area_pixels.csv", show_col_types=F) %>% select(Label, Area)
+df$Label = str_remove(df$Label,".tiff")    #drop .tiff from label column
+df = mutate(df,IMC_renamed = substring(df$Label, 1, nchar(df$Label)-2), .after=Label) # adds column IMC_renamed which will be used to pull TLS type data from other excel file, code source: https://stackoverflow.com/questions/71519313/how-to-remove-the-last-character-in-a-string-variable-in-r
+
+#load file with TLS types designated
+df2 <- read_excel("data/Updated Catalogue of TLS with S numbers.xlsx") %>% select('ImageJ_ROI', 'Type^') %>% 
+  rename(Label = 'ImageJ_ROI') %>% 
+  rename(TLS_type = 'Type^') 
+ 
+#add data from df2 to df
+df = left_join(df, df2, by='Label')
+df
+
+write_csv(df, file="output/annotated_TLS_with_area_and_type_prelim.csv")
+saveRDS(df, file="output/annotated_TLS_with_area_and_type_prelim.rds")
+
+# N.B.: x_y coordinates of annotated areas for each sample were next determined by gating .fcs files from ROIs with the same area as was annotated on tiff 
+```

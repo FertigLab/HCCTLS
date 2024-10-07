@@ -1,0 +1,1088 @@
+---
+title: "TCRB and IGH analysis, by # of GC"
+author: "Daniel Shu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# I. Preliminaries 
+### a. Load libraries 
+```{r load_libraries}
+library(tidyverse)
+library(immunarch)
+library(openxlsx)
+library(ggprism)
+library(rstatix)
+library(ggpubr)
+library(kableExtra)
+library(RColorBrewer)
+library(grid)
+library(ComplexUpset)
+library(ggsci)
+library(scales)
+library(progress)
+library(ggpmisc)
+```
+### b. Load scripts
+```{r scripts}
+source("scripts/batch_immunarch.R")
+source("scripts/batch_immunarch_singlePatient.R")
+```
+
+### c. Set common modular parameters for TCR and BCR analysis
+```{r modular_param}
+#set type of samples
+repType = "TLS"
+
+#set # of GC to include
+n_gc_included = c(1) #can be c(1) or c(1,2), or c(1, 2, 3)
+
+#set repertoire size cutoffs
+clone_cutoff_t = 500
+clone_cutoff_b = 50
+
+output.path.root = "output/adaptive/"
+ifelse(!dir.exists(output.path.root), dir.create(output.path.root, recursive=T), FALSE)
+```
+
+# II.Create master immdata object
+```{r load_master_data}
+#Load data 
+HCC_immdata_T_and_B <- read_rds(paste0(output.path.root, "HCC_immdata.rds"))
+
+#filter for TLS
+HCC_immdata_T_and_B <-
+  repFilter(
+    HCC_immdata_T_and_B,
+    .method = "by.meta",
+    .query = list(type = include(repType), 
+                  TLS_type = include(c("Mature","Involuted"))
+    )
+  )
+
+#define metadata parameters of interest
+meta.subset <-c("Patient.ID",
+                "Confirmed_CD21", "TLS_type",
+                "Location" 
+                )
+meta.subset%in%names(HCC_immdata_T_and_B$meta)
+
+#rearrange order of metadata by patient ID and repertoire
+HCC_immdata_T_and_B$meta = arrange(HCC_immdata_T_and_B$meta, Patient.ID, 
+                                   repertoire)
+
+#exclude repertoires with too many gcs (excessively liberal microdissections) or those classified as active tls but had no identifiable GC 
+HCC_immdata_T_and_B$meta$n_GC %>% unique
+include_GC = c(n_gc_included, NA) # this drops samples with 0 GC and 3 GC
+exclude_GC = unique(HCC_immdata_T_and_B$meta$n_GC)[!unique(HCC_immdata_T_and_B$meta$n_GC) %in% include_GC]
+exclude_GC
+dropped <- repFilter(HCC_immdata_T_and_B, .method = "by.meta", .query = list(n_GC = include(exclude_GC)))
+names(dropped$data)
+nrow(dropped$meta)
+# dropped$data
+
+HCC_immdata_T_and_B$meta %>% nrow
+HCC_immdata_T_and_B <- repFilter(HCC_immdata_T_and_B, .method = "by.meta", .query = list(n_GC = include(include_GC)))
+HCC_immdata_T_and_B$meta %>% nrow
+table(HCC_immdata_T_and_B$meta$Patient.ID,HCC_immdata_T_and_B$meta$repertoire)
+table(HCC_immdata_T_and_B$meta$TLS_type,HCC_immdata_T_and_B$meta$repertoire)
+
+table(HCC_immdata_T_and_B$meta$Patient.ID,HCC_immdata_T_and_B$meta$TLS_type)
+
+
+HCC_immdata_T_and_B$meta$Patient.ID = factor(HCC_immdata_T_and_B$meta$Patient.ID, levels = unique(HCC_immdata_T_and_B$meta$Patient.ID))
+
+
+#for figures, drop names J17136 from names
+names(HCC_immdata_T_and_B$data) = names(HCC_immdata_T_and_B$data)  %>% str_replace("J17136_","") %>% 
+  str_replace("_TCRB", "")
+HCC_immdata_T_and_B$meta$Sample = HCC_immdata_T_and_B$meta$Sample %>% str_replace("J17136_","") %>%
+  str_replace("_TCRB", "")
+HCC_immdata_T_and_B$meta$label = HCC_immdata_T_and_B$meta$label %>% str_replace("J17136_","")
+HCC_immdata_T_and_B$meta$Patient.ID = HCC_immdata_T_and_B$meta$Patient.ID %>% str_replace("J17136_","")
+
+#set patient name levels
+HCC_immdata_T_and_B$meta$Patient.ID = factor(HCC_immdata_T_and_B$meta$Patient.ID, levels = unique(HCC_immdata_T_and_B$meta$Patient.ID))
+
+# saveRDS(HCC_immdata_T_and_B, file = paste0(output.path.root, "HCC_immdata_T_and_B.rds"))
+# HCC_immdata_T_and_B <- readRDS(file = paste0(output.path.root, "HCC_immdata_T_and_B.rds"))
+```
+
+# III. TCR analysis
+### a. set repertoire type
+```{r tcr_setup}
+#set type of analysis "TCRB" or "IGH"
+tcrbcr = "TCRB"
+#set # of minimum clones for repertoires under analysis
+clone_cutoff=clone_cutoff_t
+
+#create output path for this analysis
+output.path = paste0(output.path.root, tcrbcr, "/")
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+```
+### b. Assign HCC_immdata object and filter for repertoire of interest
+```{r load_data_tcrbcr}
+#Subset for repertoire under analysis, as defined in previous chunk
+HCC_immdata <-
+  repFilter(HCC_immdata_T_and_B,
+            .method = "by.meta",
+            .query = list(repertoire = include(tcrbcr))
+  )
+
+# #remove small repertoires (< x clones as determined by clone_cutoff)
+HCC_immdata <-
+  repFilter(HCC_immdata,
+            .method = "by.repertoire",
+            .query = list(n_clonotypes = morethan(clone_cutoff)))
+
+HCC_immdata$meta$Patient.ID = factor(HCC_immdata$meta$Patient.ID, levels = unique(HCC_immdata$meta$Patient.ID))
+
+# add tls_pub_id column
+HCC_immdata$meta =HCC_immdata$meta %>%
+  group_by(Patient.ID,type) %>% 
+  mutate(tls_pub_id = paste0(type, " #", Order#row_number()
+                             ),.after=Sample) %>% ungroup()
+
+HCC_immdata$meta =HCC_immdata$meta %>%
+  group_by(Patient.ID,type) %>% 
+  mutate(patient_tls_pub_id = paste0(Patient.ID," ", "#", Order#row_number()
+                             ),.after=Sample) %>% ungroup()
+
+
+
+  # split(.,f=.$repertoire) %>%
+# write.xlsx(.,file=paste0(output.path.root,"TLS_pub_IDs.xlsx"))
+
+
+# saveRDS(HCC_immdata, file = paste0(output.path, "HCC_immdata_", tcrbcr,".rds"))
+# HCC_immdata <- readRDS(paste0(output.path, "HCC_immdata_", tcrbcr,".rds"))
+
+```
+### c. Shannon entropy and Simpson clonality
+#### 1. Downsampled clonality, pt.1
+writing a for loop that runs the immunarch downsample f/b shannon entropy calculation on the downsampled repertoires, then stores that clonality measurement in a vector or dataframe x 1000. then takes the median of my 1000 runs to use for comparison against other repertoires.
+```{r downsampled_clonality, eval = T}
+n_rep = 1000
+df <- HCC_immdata$meta %>% select(Sample)
+
+pb <-
+  progress_bar$new(
+    format = "(:spin) [:bar] :percent [Elapsed time: :elapsedfull || Estimated time remaining: :eta]",
+    total = n_rep,
+    complete = "=",
+    # Completion bar character
+    incomplete = "-",
+    # Incomplete bar character
+    current = ">",
+    # Current bar character
+    clear = FALSE,
+    # If TRUE, clears the bar when finish
+    width = 100
+  )      # Width of the progress bar
+
+for (j in 1:n_rep) {
+  # Updates the current state
+  pb$tick()
+  
+  set.seed(j)
+  downsampled = HCC_immdata
+  downsampled$data <- repSample(HCC_immdata$data)
+  
+  div_div <- repDiversity(downsampled$data,
+                          "div", .q = 1, .col = "aa") #.q = 1 gives you exp shannon
+  div_div$clonotypes <- 0
+  #convert from true diversity back to Shannon entropy
+  div_div$Value <- log(div_div$Value)
+  #Get number of clonotypes per sample to calculate normalized Shannon entropy
+  for (i in 1:length(downsampled[[1]])) {
+    sample <- names(downsampled[[1]][i])
+    test <- data.frame(downsampled[[1]][i])
+    # test <- data.table(downsampled[[1]][i])
+    clonotypes <-
+      length(unique(test[, 4]))##make it based on amino acid clonotypes
+    div_div$clonotypes[i] <- clonotypes
+  }
+  
+  # div_div$clonotypes <- div_div$clonotypes + 0.1 #to avoid 0 values
+  #Calculate normalized Shannon entropy
+  div_div$lnClonotypes <- log(div_div$clonotypes)
+  div_div$shannon_norm <- div_div$Value / div_div$lnClonotypes
+  div_div$Value <- 1 - div_div$shannon_norm
+  
+  ##Assign clonality to metadata
+  clonalityDF <- div_div[, c(1:2)]
+  colnames(clonalityDF) <- c("Sample", paste0("clonality", "_", j))
+  df <- right_join(df, clonalityDF, by = "Sample")
+  
+  Sys.sleep(0.1) # Remove this line and add your code
+}
+
+df = df %>%
+  rowwise() %>%
+  mutate(med = median(c_across(where(is.numeric)), na.rm = TRUE))
+# saveRDS(df, file = paste0(output.path, "downsampled_clonality.rds"))
+
+df <-  readRDS(file = paste0(output.path, "downsampled_clonality.rds")) #load df object generated in chunk above
+df = select(df, Sample, med)
+HCC_immdata$meta = left_join(HCC_immdata$meta, df, by = "Sample")
+
+saveRDS(HCC_immdata, file = paste0(output.path, "HCC_immdata_", tcrbcr,"_plus_downsampled_clonality_column.rds"))
+```
+##### a. QC plots for Shannon entropy 
+```{r qc_plots}
+# HCC_immdata <- readRDS(paste0(output.path, "HCC_immdata_", tcrbcr,"_plus_downsampled_clonality_column.rds"))
+
+HCC_immdata$meta$Patient.ID = factor(HCC_immdata$meta$Patient.ID, levels = unique(HCC_immdata$meta$Patient.ID))
+### Make QC plots to get a sense of the degree to which Shannon entropy or Simpson clonality are changed by variation in repertoire sizes
+#It seems like Shannon entropy changes less then Simpson clonality, but if you look by patient OT6 have an inverse correlation
+
+pdf(paste0(output.path, "QC_plots.pdf"),
+    height = 11,
+    width = 8.5)
+ggplot(HCC_immdata$meta, aes(x = clonality, y = med)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_text(aes(label = Sample, color = Patient.ID), show_guide = F)
+
+y <- ggplot(HCC_immdata$meta, aes(x = Clones, y = clonality)) +
+  stat_poly_line() +
+  stat_poly_eq() +
+  geom_point()
+
+z <- ggplot(HCC_immdata$meta, aes(x = Clones, y = med)) +
+  stat_poly_line() +
+  stat_poly_eq() +
+  geom_point()
+
+y2 <- ggplot(HCC_immdata$meta, aes(x = Clones, y = clonality, col = Patient.ID)) +
+  geom_point() + geom_smooth(method = 'lm', se = F)
+z2 <-
+  ggplot(HCC_immdata$meta, aes(x = Clones, y = med, col = Patient.ID)) + geom_point() + geom_smooth(method =
+                                                                                                      'lm', se = F)
+
+a <- ggplot(HCC_immdata$meta, aes(x = Clones, y = Volume)) +
+  stat_poly_line() +
+  stat_poly_eq() +
+  geom_point()
+
+((y + z) / (y2 + z2 + patchwork::plot_layout(guides = "collect"))) + a &
+  patchwork::plot_annotation(title = "Shannon Entropy (clonality = not downsampled; med = downsampled)",tag_levels ='A')
+dev.off()
+
+```
+#### 3. Replace clonality in metadata with downsampled clonality 
+```{r replace_clonality}
+#### based on these plots, taking the median of subsampling x n_rep seems to produce plots more similar to productive simpson clonality
+
+HCC_immdata$meta$clonality = HCC_immdata$meta$med
+# HCC_immdata$meta = select(HCC_immdata$meta,-med)
+```
+#### 4. Plot Shannon Entropy & Simpson Clonality
+```{r shannon_entropy plots, eval = T}
+immunarch_metadata = HCC_immdata$meta
+
+# subset for paired
+patients_w_paired_samples = immunarch_metadata[immunarch_metadata$TLS_type=="Involuted",]$Patient.ID %>% unique
+immunarch_metadata = immunarch_metadata[immunarch_metadata$Patient.ID %in% patients_w_paired_samples,] 
+immunarch_metadata = immunarch_metadata[immunarch_metadata$Location != "Adjacent Normal",]
+
+  n_mature <- sum(immunarch_metadata$TLS_type == "Mature")
+  n_involuted <- sum(immunarch_metadata$TLS_type == "Involuted")
+  
+  stat_compare_means_params_t_test_pvalue = list(  coord_cartesian(clip="off"),
+                                                   stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "t.test",
+                                        label="p.format",
+                                        size = 7))
+  stat_compare_means_params_t_test_psignif = list(  coord_cartesian(clip="off"),
+                                                    stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "t.test",
+                                        label="p.format",
+                                        size = 7))
+   stat_compare_means_params_wilcox_pvalue = list(  coord_cartesian(clip="off"),
+                                                    stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "wilcox.test",
+                                        label="p.format",
+                                        size = 7))
+  stat_compare_means_params_wilcox_psignif = list(  coord_cartesian(clip="off"),
+                                                    stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "wilcox.test",
+                                        label="p.format",
+                                        size = 7))
+
+  p<-ggplot(immunarch_metadata, aes(x = TLS_type, y = med))+ 
+    stat_boxplot(geom='errorbar', width=0.4)+
+  geom_boxplot(outlier.shape=NA, width=0.4, lwd=0.8)+
+  geom_jitter(width = 0.2, size=3,aes(color=TLS_type))+
+    theme_prism()+ggtitle("")+xlab("TLS type")+ylab(paste0(if_else(tcrbcr == "TCRB", 
+                                                                   paste0("TCR","\U03B2"), "IGH"),
+                                                           " Normalized Shannon Entropy"))+
+    ggsci::scale_color_aaas()+
+    theme(axis.text.x = element_text(angle=45,hjust=1,vjust=1),#axis.ticks.x = element_blank(),
+          legend.position="null")
+        
+   #plot by patient
+  p
+  p_bypatient_t <- p+
+    facet_wrap("Patient.ID",nrow=2)+#,scales="free_y")+#theme(axis.line.x = element_blank())+#axis.text.x=element_text(angle=45, size=12,hjust=1, vjust=1))+
+        scale_y_continuous(expand = expansion(mult = c(0, 0.1 #*max(immunarch_metadata$med)
+                                                       )))+
+    stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "t.test",
+                                        label="p.format")+
+      coord_cartesian(clip="off")
+
+  p_bypatient_t
+  
+    p_bypatient_w <- p+
+    facet_wrap("Patient.ID",nrow=2)+#,scales="free_y")+#theme(axis.line.x = element_blank())+
+      #theme(axis.text.x=element_text(angle=45, size=12,hjust=1, vjust=1))+
+              scale_y_continuous(expand = expansion(mult = c(0, 0.1 #* max(immunarch_metadata$med)
+              )))+
+    stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "wilcox.test",
+                                        label="p.format")+
+        coord_cartesian(clip="off")
+
+p_bypatient_w
+    # theme(strip.background = element_blank(), strip.text = element_blank())
+
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_t_test_bypatientOnly.pdf"))
+  print(p_bypatient_t)
+  dev.off()
+  
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_wilcox_test_bypatientOnly.pdf"))
+  print(p_bypatient_w)
+  dev.off()
+  
+  
+  ###############
+   p
+  p_bypatient_t2 <- p+
+    facet_wrap("Patient.ID",nrow=1)+#,scales="free_y")+#theme(axis.line.x = element_blank())+#axis.text.x=element_text(angle=45, size=12,hjust=1, vjust=1))+
+        scale_y_continuous(expand = expansion(mult = c(0, 0.1 #* max(immunarch_metadata$med)
+        )))+
+    stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "t.test",
+                                        label="p.format")+
+      coord_cartesian(clip="off")
+
+  p_bypatient_t2
+    
+  p_bypatient_w2<- p+
+    facet_wrap("Patient.ID",nrow=1)+#,scales="free_y")+#theme(axis.line.x = element_blank())+
+      #theme(axis.text.x=element_text(angle=45, size=12,hjust=1, vjust=1))+
+              scale_y_continuous(expand = expansion(mult = c(0, 0.1 #* max(immunarch_metadata$med)
+                                                             )))+
+    stat_compare_means(comparisons = list(c("Mature","Involuted")),
+                                        method = "wilcox.test",
+                                        label="p.format")+
+        coord_cartesian(clip="off")
+
+p_bypatient_w2
+    # theme(strip.background = element_blank(), strip.text = element_blank())
+
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_t_test_bypatientOnly2.pdf"),width=12,height=6)
+  print(p_bypatient_t2)
+  dev.off()
+  
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_wilcox_test_bypatientOnly2.pdf"),width=12,height=6)
+  print(p_bypatient_w2)
+  dev.off()
+  
+  ################
+  
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_t_test.pdf"),width=4)
+  print(p+stat_compare_means_params_t_test_pvalue)
+  print(p+stat_compare_means_params_t_test_psignif)
+  print(p_bypatient_t)
+  dev.off()
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_t_test_2.pdf"),width=8)
+  print((p+stat_compare_means_params_t_test_psignif) +
+          p_bypatient_t +xlab("")+ylab("")+ plot_layout(guides="collect",width=c(1,2)))
+  dev.off()
+  
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_wilcox_test.pdf"),width=4)
+  print(p+stat_compare_means_params_wilcox_pvalue)
+  print(p+stat_compare_means_params_wilcox_psignif)
+  print(p_bypatient_w)
+    dev.off()
+  pdf(paste0(output.path, "mature_v_involuted_downsampled_shannon_wilcox_test_2.pdf"),width=8)
+  print((p+stat_compare_means_params_wilcox_psignif) + 
+          p_bypatient_w +xlab("")+ylab("")+ plot_layout(guides="collect",width=c(1,2)))
+  dev.off()
+  
+  t.test(med ~ TLS_type, data=immunarch_metadata) 
+  wilcox.test(med ~ TLS_type, data=immunarch_metadata) 
+```
+### d. Save object
+```{r save_object}
+saveRDS(HCC_immdata, paste0(output.path,"HCC_immdata", "_", repType, "_", tcrbcr, "_final_for_seurat.rds"))
+
+HCC_immdata <- readRDS(paste0(output.path,"HCC_immdata", "_", repType, "_", tcrbcr, "_final_for_seurat.rds"))
+
+```
+### e. summary stats
+```{r summary_stats}
+# for clone count and volume, determine summary stats
+descriptive_df1 <- HCC_immdata$meta %>% select(Clones, Volume) %>% 
+  # split(.$Patient.ID) %>%  
+  # map(summary) 
+  psych::describe() %>% as.data.frame %>%  rownames_to_column(.,var="rowname") %>% 
+  mutate(Patient.ID = "All",.before = "rowname")
+descriptive_df1
+descriptive_df2 <- HCC_immdata$meta %>% select(Patient.ID, Clones, Volume) %>% 
+  split(.$Patient.ID) %>%
+  map(~psych::describe(.) %>% as.data.frame %>% rownames_to_column(.,var="rowname")) %>% 
+  bind_rows(.id="Patient.ID") %>% dplyr::filter(rowname!="Patient.ID*") 
+descriptive_df2
+descriptive_df <- bind_rows(descriptive_df1,descriptive_df2) %>% select(Patient.ID, rowname, mean, sd, median, min, max, range, se)
+descriptive_df %>% write.csv(., paste0(output.path,"descriptive_stats_clones_volume_", tcrbcr, ".csv"), row.names = F)
+
+# df$repertoire <- factor(df$repertoire, levels=c("TCRB","IGH"))
+# df$patient = factor(df$patient, levels = unique(df$patient))
+
+#export describe stats
+HCC_immdata$meta %>% select(Patient.ID, Clones, Volume) %>% split(.$Patient.ID) %>%
+  map(summary) %>% 
+  lapply(as.data.frame.matrix) %>% bind_rows(.id="patient") %>% 
+  # write.csv(., paste0(output.path,"descriptive_stats_clones_volume_summaryfunction_", tcrbcr, ".csv"), row.names = F) 
+  writexl::write_xlsx(path=paste0(output.path,"descriptive_stats_clones_volume_summaryfunction_", tcrbcr, ".xlsx"))
+
+HCC_immdata$meta %>% select(Clones, Volume) %>% 
+  summary %>% as.data.frame.matrix %>% 
+  writexl::write_xlsx(path=paste0(output.path,"descriptive_stats_clones_volume_summaryfunction_", tcrbcr, "_ALL.xlsx"))
+
+
+#determine % of each repertoire comprised of clones > 3
+df = HCC_immdata$data %>%
+  bind_rows(.id = "Sample") %>% mutate(Patient = str_replace(Sample, "-.*",""),.before=Sample) %>%
+  group_by(Sample) %>% mutate(
+    singleton_expanded = case_when(Clones ==1  ~ "singleton",
+                                                   Clones != 1 ~ "non_singleton"))
+df = merge(df,select(HCC_immdata$meta,Sample,TLS_type)) #add TLS type column
+#determine % of each repertoire comprised of singletons
+df_summarized = df %>% group_by(Patient,Sample,TLS_type,singleton_expanded) %>% summarise(sum_all_clones = sum(Clones)) %>% 
+  mutate(pct = 100 * sum_all_clones / sum(sum_all_clones)) %>% ungroup
+
+print("descriptive stats % singletons")
+df_summarized %>% select(TLS_type,singleton_expanded,pct) %>% split(.$singleton_expanded) %>%  
+  map(~psych::describe(.))  
+
+print("descriptive stats % singletons, by TLS type")
+df_summarized %>% select(TLS_type,singleton_expanded,pct) %>% split(.$TLS_type) %>%  
+  map(~split(.,.$singleton_expanded) %>% 
+        map(~psych::describe(.)))
+
+```
+### e. Plots
+#### 1. Run batched immunarch commands for all samples
+```{r batched_functions, echo = FALSE, eval = T}
+output.path = paste0(output.path.root, tcrbcr, "/all/")
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+
+exploratory(HCC_immdata)
+clonality(HCC_immdata)
+repOv(HCC_immdata)
+gene.usage(HCC_immdata)
+diversity(HCC_immdata)
+
+#downsample 
+output.path = paste0(output.path, "downsampled/")
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+HCC_immdata_downsampled =  HCC_immdata
+HCC_immdata_downsampled$data <- repSample(HCC_immdata_downsampled$data)
+
+exploratory(HCC_immdata_downsampled)
+clonality(HCC_immdata_downsampled)
+repOv(HCC_immdata_downsampled)
+gene.usage(HCC_immdata_downsampled)
+diversity(HCC_immdata_downsampled)
+
+rm(HCC_immdata_downsampled)
+```
+#### 2. Upset plots
+```{r upset_plots}
+output.path = paste0(output.path.root, tcrbcr,"/upset_plots/")
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+
+#before making upset plots,  revert to plotting pre-summarised data by passing the following function as data to geom_bar
+#this allows me to put log scale on intersections
+# https://stackoverflow.com/questions/71878037/how-to-to-assign-logarithmic-scale-to-intersection-size-using-complexupset-lib
+presence = ComplexUpset:::get_mode_presence('exclusive_intersection')
+
+summarise_values = function(df) {
+    aggregate(
+        as.formula(paste0(presence, '~ intersection')),
+        df,
+        FUN=sum
+    )
+}
+
+for (i in unique(HCC_immdata$meta$Patient.ID)) {
+  length.test = length(HCC_immdata$data[grep(i,names(HCC_immdata$data))])
+  if (length.test > 1) {
+    temp <- HCC_immdata$data[grep(i,names(HCC_immdata$data))]
+    meta = HCC_immdata$meta %>% ungroup() %>%  select(Sample,tls_pub_id)
+    #change names to drop "-T_TCRB"
+    # names(temp) = str_replace(names(temp), "-T_TCRB|-B","")
+    
+    # #this returns unique clonotypes
+    # unique_clones <- sapply(temp,nrow)
+    # #this returns total clones 
+    # tot_clones <- sapply(temp, function(i) {sum(i$Clones)})
+    
+    #create data.frame in format needed for upset function, using the pubRep function from immunarch
+    upset_df <- pubRep(temp, "aa", .verbose = F)
+  
+  
+    #change column names for samples to tls_pub_id 
+    TLS_col_nums = grep(i, colnames(upset_df))
+    names(upset_df)[TLS_col_nums] = meta$tls_pub_id[match(colnames(upset_df)[TLS_col_nums],meta$Sample)]
+    # #pull column names of TLS for 'repertoires' object
+    repertoires=colnames(upset_df)[TLS_col_nums]
+
+    
+     
+    #add column for fill by adding a new column, tot_count, which sums across TLS_col_nums
+    upset_df <- upset_df %>% 
+      mutate(tot_count = select(., colnames(upset_df)[TLS_col_nums]) %>% rowSums(na.rm = TRUE))
+    #then add expansion column, which will have the value "singleton" or "expanded" according to the value of the new column
+    upset_df <- upset_df %>% 
+      mutate(expansion = case_when(tot_count==1 ~ "Singleton (n = 1)", 
+                                   tot_count >= 2 & tot_count <= 5 ~ "Small (n = 2-5)",
+                                   tot_count >= 6 & tot_count <=20 ~ "Medium (n = 6-20)", 
+                                   tot_count >=21 & tot_count <=100 ~ "Large (n = 21-100)",
+                                   tot_count > 100 ~ "Hyperexpanded (n > 100)")
+             )
+    upset_df$expansion <- factor(upset_df$expansion, levels=c("Singleton (n = 1)",
+                                                                "Small (n = 2-5)",
+                                                                "Medium (n = 6-20)", 
+                                                                "Large (n = 21-100)",
+                                                                "Hyperexpanded (n > 100)"))
+                      
+    expansion_colors = rev(ggsci::pal_futurama()(length(levels(upset_df$expansion))))
+    names(expansion_colors) = levels(upset_df$expansion)
+    
+    #convert counts per TLS to binary
+    nrow(upset_df)
+    cols_to_spare <- names(upset_df)[!names(upset_df) %in% repertoires] #first define columns that won't be converted
+    upset_df <- mutate_each(upset_df, funs(ifelse(is.na(.), 0, 1)), -cols_to_spare)
+    nrow(upset_df)
+    # View(upset_df)
+    
+    p <-upset(upset_df,
+      repertoires, name="Intersection Groups",
+      base_annotations=list(
+        # 'Intersections'=intersection_size(
+        #   counts=F
+          # text=list(
+          #   vjust=-1,
+          #   hjust=-1,
+          #   angle=90#,
+          #   # size=4
+          #   )
+        # )
+                'Intersections'=(
+            ggplot()
+            + geom_bar(data=summarise_values, 
+                       stat='identity', 
+                       aes(y=!!presence))
+            # +ylab('log(Intersections + 1)')
+            # +scale_y_continuous(trans=log1p_trans(),
+              +ylab('Intersections')
+            + scale_y_log10( 
+            # +scale_y_continuous(trans='log10',
+            #                     breaks = trans_breaks("log10", function(x) 10^x),
+                                labels=scales::comma)
+                                # labels = trans_format("log10", math_format(10^.x))) http://www.sthda.com/english/wiki/ggplot2-axis-scales-and-transformations#google_vignette
+        )
+      ),
+      annotations = list(
+        'Repertoire composition'=(
+          ggplot(mapping=aes(fill=expansion))
+          + geom_bar(stat='count', position='fill')
+          + scale_y_continuous(labels=scales::percent_format())
+          + scale_fill_manual(values=expansion_colors)
+          + ylab('Repertoire composition')
+          +theme(legend.title = element_blank(),
+                 legend.key.size = unit(0.5, 'cm'),
+                 legend.key=element_rect(colour="white"),
+                 legend.position="bottom") # removes legend title
+        )
+      ),
+      sort_intersections_by=c('degree','cardinality'),
+      sort_sets='descending',
+      width_ratio=0.1,
+      set_sizes=(
+        upset_set_size(
+          geom=geom_bar(
+            aes(fill=expansion, x=group),
+            width=0.8,
+            position="stack"),
+          position="right") 
+        # + geom_text(aes(label=..count..), hjust=1.1, stat='count')
+        # you can also add annotations on top of bars:
+        # + annotate(geom='text', label='@', x='Drama', y=850, color='white', size=3)
+        # + expand_limits(y=1100)
+        +scale_fill_manual(values=expansion_colors)
+        + theme(axis.text.x=element_text(angle=90),
+                axis.title.x = element_text(size=10),
+                legend.position = "none")
+        + ylab(paste0('Unique ', 
+                      if_else(tcrbcr == "TCRB",
+                              paste0("TCR","\U03B2"), "IGH")))
+                      # tcrbcr))
+        ),
+      min_size=
+        if_else(tcrbcr=="TCRB",20,1) # note I exclude intersections with < 20 TCRs for the sake of readability
+      # n_intersections=20 #set fixed # of interactions
+    )
+      # upset_test(upset_df,
+    #   repertoires)
+    p <- p +plot_annotation(title = paste0(if_else(tcrbcr == "TCRB", 
+                                              paste0("TCR","\U03B2"), 
+                                              "IGH"),
+                                      " clonotype sharing across TLS for patient ", i))&
+      theme(text = element_text(#family="Arial",
+                                face="bold",hjust=0.5),
+        plot.title = element_text(hjust = 0.5,size=14))
+    pdf(paste0(output.path,"upset_plot_",i,".pdf"),height=6,width=10,onefile=T)
+    print(p)
+      dev.off()
+    if (i == "OT6"){
+          pdf(paste0(output.path,"upset_plot_",i,"_bigger.pdf"),height=9,width=15,onefile=FALSE); print(p); dev.off()
+    }
+    
+    write.csv(upset_df, paste0(output.path,"upset_df_", i, "_", tcrbcr,".csv"),row.names = F)
+    rm(list=c("p","upset_df","cols_to_spare","expansion_colors","repertoires","TLS_col_nums","temp"))
+    }
+  else {print(paste0("Upset plot skipped for patient ", i))
+    }
+}
+```
+
+#### 3. Run batched immunarch commands by patient
+```{r batched_functions_bypatient, echo = FALSE, eval = T}
+for (i in unique(HCC_immdata$meta$Patient.ID)) {
+  output.path = paste0(output.path.root, tcrbcr, 
+                       "/", i, "/")
+  ifelse(!dir.exists(output.path),dir.create(output.path, recursive = T),FALSE)
+  #Filter data for specific part of data under analysis
+  x <-
+    repFilter(HCC_immdata,
+              .method = "by.meta",
+              .query = list(Patient.ID = include(i)))
+  #export filtered data for use with single cell data
+  saveRDS(x, file = paste0(output.path, paste0("HCC_immdata_", repType, "_", i, ".rds")))
+  
+  exploratory.single.patient(x)
+  if (nrow(HCC_immdata$meta[HCC_immdata$meta$Patient.ID == i, ]) > 1) {
+    clonality.single.patient(x)
+    tc(x)
+  } else {
+    print(
+      paste0(
+        "Clonality and Track Clonotypes not calculated since there is only 1 repetoire for patient ",
+        i
+      )
+    )
+  }
+  if (nrow(HCC_immdata$meta[HCC_immdata$meta$Patient.ID == i, ]) > 2) {
+    repOv.single.patient(x)
+  } else {
+    print(
+      paste0(
+        "Rep overlap not calculated since there is 2 or fewer repetoire(s) for patient ",
+        i
+      )
+    )
+  }
+  gene.usage.single.patient(x)
+  diversity.single.patient(x)
+}
+```
+#### 4. Run batched immunarch commands by patient, with downsampling
+Downsamples each patient's repertoires to the smallest repertoire, by patient and then run same batched immunarch commands by patient on subsetted patients, with downsampling
+```{r batched_functions_bypatient_downsampled, echo=FALSE, eval = T}
+for (i in unique(HCC_immdata$meta$Patient.ID)) {
+  if (nrow(HCC_immdata$meta[HCC_immdata$meta$Patient.ID == i,]) > 1) {
+    indices = grep(i, names(HCC_immdata$data))
+    HCC_immdata$data[indices] <- repSample(HCC_immdata$data[indices])
+    print(paste0("Downsampling completed for patient ", i))
+  } else {
+            print(paste0("Downsampling not done since there is only 1 repetoire for patient ", i))}
+}
+
+for (i in unique(HCC_immdata$meta$Patient.ID)) {
+     output.path = paste0(output.path.root, tcrbcr, 
+                       "/", i, "/downsampled/")
+   ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+      #Filter data for specific part of data under analysis
+    x <- repFilter(HCC_immdata,.method="by.meta",.query=list(Patient.ID=include(i)))
+    #export filtered data for use with single cell data
+    saveRDS(x, file = paste0(output.path, paste0("HCC_immdata_", repType, "_", i, ".rds")))
+
+    exploratory.single.patient(x)
+    if (nrow(HCC_immdata$meta[HCC_immdata$meta$Patient.ID == i,]) > 1) {
+      clonality.single.patient(x)
+      tc(x)
+      } else {
+            print(paste0("Clonality and Track Clonotypes not calculated since there is only 1 repetoire for patient ", i))}
+    if (nrow(HCC_immdata$meta[HCC_immdata$meta$Patient.ID == i, ]) > 2) {
+      repOv.single.patient(x)
+      } else {
+        print(paste0("Rep overlap not calculated since there is 2 or fewer repetoire(s) for patient ",
+        i
+        )
+        )
+        }
+    gene.usage.single.patient(x)
+    diversity.single.patient(x)
+}
+```
+
+# IV. IGH analysis
+### a. set repertoire type
+```{r bcr_setup}
+#set type of analysis "TCRB" or "IGH"
+tcrbcr = "IGH"
+#set # of minimum clones for repertoires under analysis
+clone_cutoff=clone_cutoff_b
+#create output path for this analysis
+output.path = paste0(output.path.root, tcrbcr, "/")
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+```
+### b. Run code chunks defined above for TCR analysis 
+```{r}
+<<load_data_tcrbcr>>
+<<downsampled_clonality>>
+<<qc_plots>>
+<<replace_clonality>>
+<<shannon_entropy plots>>
+<<save_object>>
+<<summary_stats>>
+<<batched_functions>>
+<<upset_plots>>
+<<batched_functions_bypatient>>
+<<batched_functions_bypatient_downsampled>>
+```
+### c. SHM at mature vs involuted
+```{r}
+meta.TLS <- HCC_immdata$meta[HCC_immdata$meta$TLS_type %in% c("Mature", "Involuted"),] 
+my_comparisons=list(c("Mature", "Involuted"))
+
+### SHMs for other patients
+df <- HCC_immdata$data %>% bind_rows(.,.id="Sample") #create on df of all B cell data
+
+df = left_join(df, HCC_immdata$meta, by="Sample") #add metadata using the sample column
+
+# subset for paired
+patients_w_paired_samples = df[df$TLS_type=="Involuted",]$Patient.ID %>% unique
+df = df[df$Patient.ID %in% patients_w_paired_samples,]  
+
+
+my_comparisons=list(c("Mature", "Involuted"))
+
+df = df[df$TLS_type %in% c("Mature", "Involuted"),] #subset for TLS (i.e. to remove TDLN)
+
+p2<-ggplot(df, aes(x=TLS_type,y=valignsubstitutioncount, fill=TLS_type))+
+  geom_violin(trim=T)+
+  geom_boxplot(width=0.1,fill="white", outlier.shape=NA)+
+  stat_compare_means(method="t.test", comparisons=my_comparisons,label="p.format",size=5)+
+    # scale_y_continuous(expand = expansion(mult = c(0, 0.15)))+
+  xlab("TLS type")+ylab("IGH V gene substitutions")+
+  # facet_wrap(~Patient.ID)+
+  scale_fill_aaas()+
+  ggprism::theme_prism()+
+    theme(legend.text = element_text(face="bold"),
+          axis.text.x=element_text(angle=45,hjust=1,vjust=1),
+          legend.position="null"#,axis.ticks.x = element_blank()
+          )+
+    coord_cartesian(clip="off")
+
+p2  
+
+p3<-p2 + facet_wrap(~Patient.ID,nrow=1)
+
+p3
+
+p4 <- p2 + facet_wrap(~Patient.ID,nrow=1)
+p4
+
+pdf(paste0(output.path.root,"SHM_mature_resolved_1.pdf"),width=4);p2;dev.off()
+pdf(paste0(output.path.root,"SHM_mature_resolved_2.pdf"));p3;dev.off()
+pdf(paste0(output.path.root,"SHM_mature_resolved_3.pdf"), width=12, height=8);p2+p3;dev.off()
+pdf(paste0(output.path.root,"SHM_mature_resolved_4.pdf"),width=12,height=6);p4;dev.off()
+
+```
+
+# V. Determine % repertoire sharing
+
+```{r}
+output.path = output.path.root
+ifelse(!dir.exists(output.path), dir.create(output.path, recursive=T), FALSE)
+
+make_df_for_pct_shared_total_and_unique <- function(immunarch_obj){ 
+  #make plot of unique clonotypes
+df = data.frame()
+for (i in unique(immunarch_obj$meta$Patient.ID)) {
+  length.test = length(immunarch_obj$data[grep(i,names(immunarch_obj$data))])
+  if (length.test > 1) {
+    temp <- immunarch_obj$data[grep(i,names(immunarch_obj$data))]
+    #change names to drop "-T_TCRB"
+    # names(temp) = str_replace(names(temp), "-T|-B","")
+    
+    pubRep_count <- pubRep(temp, "aa+v", .verbose = F,.quant="count")
+    pubRep_count_shared = pubRep_count[pubRep_count$Samples > 1,]
+    
+    #first, calculates the % total clonotypes that are shared, per repertoire 
+    data_pct_total_clonotypes = 
+      100 *pubRep_count_shared[,4:length(pubRep_count_shared)] %>% colSums(na.rm=T) /
+      pubRep_count[,4:length(pubRep_count)] %>% colSums(na.rm=T)  
+    
+    #then calculate the % unique clonotypes that are shared, per repertoire
+    pubRep_count_unique <- mutate_each(pubRep_count, funs(ifelse(is.na(.), 0, 1)), 
+                                names(pubRep_count)[grep(i,names(pubRep_count))] #specifies that we mutate just the TLS columns 
+                                )
+    pubRep_count_unique_shared = pubRep_count_unique[pubRep_count_unique$Samples > 1,]
+
+    data_pct_unique_clonotypes = 
+      100 *pubRep_count_unique_shared[,4:length(pubRep_count_unique_shared)] %>% colSums(na.rm=T) /
+      pubRep_count_unique[,4:length(pubRep_count_unique)] %>% colSums(na.rm=T)  
+    #then add these data to df
+    df2 = data.frame(pct_shared_total_clonotypes= data_pct_total_clonotypes,
+                              pct_shared_unique_clonotypes= data_pct_unique_clonotypes)
+
+    df = rbind(df, df2)
+      }   else {print(paste0("Calculations skipped for patient ", i))
+      }
+}
+return(df)
+}
+
+reps = c("TCRB","IGH")
+df_reps <- lapply(1:length(reps), function(i) {
+  readRDS(paste0(output.path, reps[[i]], "/HCC_immdata_", repType, "_", reps[[i]], "_final_for_seurat.rds"))
+}) %>% `names<-`(reps)
+
+df_tcr <- make_df_for_pct_shared_total_and_unique(df_reps$TCRB) %>% 
+  mutate(repertoire = "TCRB")
+df_bcr <- make_df_for_pct_shared_total_and_unique(df_reps$IGH) %>% 
+  mutate(repertoire = "IGH")
+
+df = bind_rows(df_tcr,df_bcr)
+
+df
+df = df %>% 
+  mutate_at(vars(starts_with("pct_shared")), funs(round(., 1))) %>% 
+  rownames_to_column(var="TLS") %>% 
+  mutate(patient = str_replace_all(TLS,"-.*",""),.before='TLS') 
+
+df$repertoire <- factor(df$repertoire, levels=c("TCRB","IGH"))
+df$patient = factor(df$patient, levels = unique(df$patient))
+
+df %>% write.csv(., paste0(output.path,"repertoire_sharing_df_TCRB_IGH.csv"),row.names = F)
+
+#export describe stats
+by(df,df$repertoire,summary) %>% lapply(as.data.frame.matrix) %>% bind_rows(.id="repertoire")
+by(df,df$repertoire,summary) %>% lapply(as.data.frame.matrix) %>% bind_rows(.id="repertoire") %>% 
+  writexl::write_xlsx(path=paste0(output.path,"repertoire_sharing_TCRB_IGH_stats_summary.xlsx"))
+
+psych::describe(df~repertoire) %>% lapply(as.data.frame.matrix) %>% 
+  lapply(rownames_to_column,var="Var") %>% 
+  bind_rows(.id="repertoire") 
+
+  psych::describe(df~repertoire) %>% lapply(as.data.frame.matrix) %>% 
+  lapply(rownames_to_column,var="Var") %>% 
+  bind_rows(.id="repertoire") %>% 
+  writexl::write_xlsx(path=paste0(output.path,"repertoire_sharing_TCRB_IGH_stats.xlsx"))
+
+#table(df$patient,df$repertoire)
+
+p <- ggplot(df, aes(x=repertoire, 
+               y=pct_shared_unique_clonotypes ,
+               group=repertoire,fill=repertoire))+
+  stat_boxplot(geom='errorbar', width=0.4)+
+  geom_boxplot(outlier.shape=NA, 
+               width=0.4, lwd=0.8)+
+  geom_jitter(width = 0.2, size=2)+#, aes(color=patient))+
+    
+  # geom_boxplot(#alpha = 0.1,
+  #              width=0.6) +
+  # geom_point(position=position_jitterdodge(jitter.width=0.8))+
+  ggprism::theme_prism()+
+    # theme_classic()+
+  xlab("")+
+  ylab("Repertoire shared with TLS from same tumor  (%)")+
+  stat_compare_means(method="t.test",hide.ns=F,label="p.format", 
+                     comparisons=list(c("TCRB", "IGH")),
+                     size = 8)+
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.1)))+
+  scale_x_discrete(labels=c("TCRB"="TCR\u03B2", "IGH" = "IGH"))+
+  ggsci::scale_fill_npg()+
+  theme(legend.position = "none")+
+    coord_cartesian(clip="off")
+p
+p1 <- p+facet_wrap(~patient,nrow=2)
+p1
+
+pdf(paste0(output.path,"repertoire_sharing_TCRB_IGH.pdf"),width=4,onefile=FALSE);print(p);dev.off()
+pdf(paste0(output.path,"repertoire_sharing_TCRB_IGH_byPatient.pdf"),onefile=FALSE);print(p1);dev.off()
+
+p2<-ggplot(df, aes(x=patient, 
+               y=pct_shared_unique_clonotypes ,
+               # group=repertoire,
+               fill=repertoire))+
+ stat_boxplot(geom='errorbar', width=0.4)+
+  geom_boxplot(outlier.shape=NA, 
+               width=0.4, lwd=0.8)+
+  geom_jitter(width = 0.2, size=1)+#, aes(color=patient))+
+    
+    # geom_boxplot(#alpha = 0.1,
+  #              width=0.8) +
+  # geom_point(position=position_jitterdodge(jitter.width=0.4))+
+  ggprism::theme_prism()+
+    # theme_classic()+
+  xlab("Patient")+
+  ylab("Repertoire shared with TLS from same tumor  (%)")+
+  stat_compare_means(method="t.test",hide.ns=F,label="p.format")+
+  ggsci::scale_fill_npg()+
+    coord_cartesian(clip="off")
+                     # , comparisons=list(c("TCRB", "IGH"))
+                    #+
+  # scale_y_continuous(expand = expansion(mult = c(0.1, 0.1)))#+
+  # theme(legend.position = "none")
+p2
+pdf(paste0(output.path,"repertoire_sharing_TCRB_IGH_byPatient2.pdf"),onefile=FALSE,width=12);print(p2);dev.off()
+
+####################################################################
+##### for reviewers, make plot showing overlap by TLS location
+HCC_immdata_T_and_B <- readRDS(file = paste0(output.path.root, "HCC_immdata_T_and_B.rds"))
+
+meta_slim <- HCC_immdata_T_and_B$meta %>% 
+  select(Sample,TLS_type,Location) 
+meta_slim = meta_slim[meta_slim$Sample %in% df$TLS,]
+df = left_join(df,meta_slim, by=join_by(TLS == Sample))
+
+df$TLS_type_Location = paste0(df$TLS_type, "_", df$Location)
+levels_TLS_type_Location = c("Mature_Intratumoral",
+                                                             "Mature_Peritumoral", 
+                                                             "Mature_Adjacent Normal",
+                                                             "Involuted_Intratumoral")
+df$TLS_type_Location = factor(df$TLS_type_Location, levels=levels_TLS_type_Location)
+
+
+    
+  # stat_boxplot(geom ='errorbar', width=0.25, size=0.7, coef=4, position=position_dodge(0.85)) +
+
+p <- ggplot(df, aes(x=repertoire, 
+               y=pct_shared_unique_clonotypes ,
+               # group=repertoire,
+               fill=TLS_type_Location))+
+  stat_boxplot(geom='errorbar', position=position_dodge())+
+  geom_boxplot(outlier.shape=NA,lwd=1)+
+  # geom_point(position = position_dodge(width = .75), size = 3) +
+    geom_point(position = position_jitterdodge(dodge.width = .75), size = 3) +
+
+    ggprism::theme_prism()+
+    # theme_classic()+
+  xlab("")+
+  ylab("Repertoire shared with TLS from same tumor  (%)")+
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.1)))+
+  scale_x_discrete(labels=c("TCRB"="TCR\u03B2", "IGH" = "IGH"))+
+  ggsci::scale_fill_npg()+
+  # theme(legend.position = "none")+
+    coord_cartesian(clip="off")
+# p
+
+
+
+
+#### Fit Data ####
+fit <- df %>% 
+  group_by(repertoire) %>% 
+  anova_test(pct_shared_unique_clonotypes ~ TLS_type_Location) %>% 
+  add_significance()
+
+#### Run Tukey ###
+tukey <- df %>% 
+  group_by(repertoire) %>% 
+  tukey_hsd(pct_shared_unique_clonotypes ~ TLS_type_Location) %>% 
+  add_significance() %>% 
+  ungroup() %>% 
+  add_xy_position(x="repertoire",dodge=0.8)
+
+
+p1 <-p+ 
+  stat_pvalue_manual(
+    tukey, label = "p.adj", tip.length = 0.01,
+    bracket.nudge.y = -2,
+      inherit.aes = F
+    ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05)))+
+  theme(legend.position=c(0.75,0.85),#"right",
+        legend.text = element_text(face="bold"))
+p1
+pdf(paste0(output.path,"repertoire_sharing_TCRB_IGH_grouped_by_location.pdf"),onefile=FALSE);print(p1);dev.off()
+
+```
+
+# VI. Export metadata for extended data table
+
+```{r}
+#export metadata for extended data table pre filtering
+df = HCC_immdata_T_and_B$meta %>% as.data.frame()
+
+df_list <- lapply(unique(df$TLS_type), function(i) {
+  x <- df %>% filter(repertoire=="TCRB") %>% select(Patient.ID, TLS_type, Location) %>%
+  filter(TLS_type == i) %>% 
+  group_by(Patient.ID,TLS_type,Location) %>% 
+  summarise(n=n()) %>% ungroup() %>% 
+  pivot_wider(.,names_from = Location, values_from = n) %>% 
+  replace(is.na(.), 0) %>% 
+  select(-TLS_type) %>% 
+  relocate(Intratumoral, .after=Patient.ID) %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) sum(.) else "Total"))
+  return(x)
+}) %>% `names<-`(unique(df$TLS_type))
+df_list
+
+writexl::write_xlsx(df_list, paste0(output.path.root,"extended_data_table_characteristics_of_microdissected_TLS_before_filtering.xlsx"))
+
+#export metadata for extended data table after filtering
+HCC_immdata_t <- readRDS(file = paste0("output/adaptive/TCRB/", "HCC_immdata_TCRB",".rds"))
+HCC_immdata_t$meta$Patient.ID = factor(HCC_immdata_t$meta$Patient.ID, levels = unique(HCC_immdata_t$meta$Patient.ID))
+
+df2 = HCC_immdata_t$meta %>% select(Patient.ID, TLS_type, Location) %>%
+  group_by(Patient.ID,TLS_type,Location) %>% 
+  summarise(n=n()) %>% ungroup() %>% 
+  pivot_wider(.,names_from = TLS_type, values_from = n) %>% 
+  replace(is.na(.), 0) %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) sum(.) else "Total")) 
+df2
+
+write.csv(df2, paste0(output.path.root,"extended_data_table_characteristics_of_microdissected_TLS_T_after_filtering.csv"), row.names = F)
+
+HCC_immdata_b <- readRDS(file = paste0("output/adaptive/IGH/", "HCC_immdata_IGH",".rds"))
+HCC_immdata_b$meta$Patient.ID = factor(HCC_immdata_b$meta$Patient.ID, levels = unique(HCC_immdata_b$meta$Patient.ID))
+
+df3 = HCC_immdata_b$meta %>% select(Patient.ID, TLS_type, Location) %>%
+  group_by(Patient.ID,TLS_type,Location) %>% 
+  summarise(n=n()) %>% ungroup() %>% 
+  pivot_wider(.,names_from = TLS_type, values_from = n) %>% 
+  replace(is.na(.), 0) %>% 
+  bind_rows(summarise_all(., ~if(is.numeric(.)) sum(.) else "Total")) 
+df3
+
+write.csv(df3, paste0(output.path.root,"extended_data_table_characteristics_of_microdissected_TLS_B_after_filtering.csv"), row.names = F)
+```
+# VII. SessionInfo
+```{r}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_ImmunoSEQ_microdissectedTLS_TCR_BCR.txt")
+```
+

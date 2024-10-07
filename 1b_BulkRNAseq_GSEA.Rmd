@@ -1,0 +1,862 @@
+---
+title: "Bulk RNAseq_GSEA"
+author: Ludmila Danilova (later modified by Daniel Shu)
+date: 2021-11-09 (2022-05-11) with further modifications on 2022/10/5
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE
+)
+```
+
+# I. Setup
+### a. Load libraries
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(DESeq2)
+library(ggrepel)
+library(msigdbr)
+library(data.table)
+library("DT")
+library(RColorBrewer)
+library(viridis)
+library(EnhancedVolcano)
+library(ggplotify)
+library(tools)
+library(pca3d)
+library(edgeR)
+library(pheatmap)
+library("ComplexHeatmap")
+library(circlize)
+library(ggprism)
+library(writexl)
+library(fgsea)
+
+```
+
+# II. Load data
+
+```{r}
+DE_res <- readRDS("output/RNASeq/DE_res.rds")
+output.path = "./output/RNAseq_GSEA/"
+ifelse(!dir.exists(file.path(output.path)), dir.create(file.path(output.path)), FALSE)
+```
+
+### e. GSEA
+
+Create the modular GSEA analysis code (N.B. this will be rerun again below for other gene sets)
+
+```{r gsea_run, echo=FALSE,  fig.width = 10, eval=FALSE}
+#create output directory if none exists
+ifelse(!dir.exists(file.path(output.path, geneSet)), dir.create(file.path(output.path, geneSet)), FALSE)
+
+# function that uses DE results and runs gene set enrichment analysis on paths
+runGSEA_padj = function(deRes,paths)
+{
+  # library(fgsea)
+  # create a stat object to use in the pathway analysis
+  stat <- deRes$stat
+  names(stat) <- row.names(deRes)
+  
+  # run GSE
+  gseTest_h = fgsea(paths,stat)
+  gseTest_h = gseTest_h[order(gseTest_h$NES),]
+  return(gseTest_h)
+}
+gseTest_h = runGSEA_padj(DE_res, m_list)
+fwrite(gseTest_h, file= paste0(output.path, geneSet, '/pathwayAnalysisResults_', geneSet, '.csv'), 
+       sep=",", 
+       sep2=c("", " ", ""))
+
+# datatable(gseTest_h)
+```
+
+
+```{r gsea_plots, echo=FALSE,  eval=FALSE}
+##Plot the normalized enrichment scores. Color the bar indicating whether or not the pathway was significant:
+## NOTE: This is additional code I have added to Luda's following this vignette online for fgsea (https://stephenturner.github.io/deseq-to-fgsea/#using_the_fgsea_package)
+
+
+### generate plots for enrichment score
+enrichment.score <- function(deRes, paths, pathway) 
+{
+  # library(fgsea)
+  stat <- deRes$stat
+  names(stat) <- row.names(deRes)
+
+  x <- plotEnrichment(paths[[pathway]],
+                 stat) + labs(title = pathway) + theme(plot.title =
+                                                         element_text(hjust=0.5,face="bold",size=16),
+                                                       axis.title = element_text(face="bold",size=14),
+                                                       axis.text = element_text(face="bold",size=12))
+  # x$layers[[1]]$aes_params$size  = 1 #this comes from https://stackoverflow.com/questions/64035941/changing-the-point-size-of-a-ggplot2-object-after-creation
+  x$layers[[5]]$aes_params$size = 1
+  print(x)
+}
+
+########
+########
+#make object up.pathways for every gene set identified with p < 0.05 and positive enrichment score
+gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES>0,]$pathway -> up.pathways
+#plot these
+pdf(paste0(output.path, geneSet, "/gsea_enrichment_score_",geneSet,".pdf"),width=7,height=5)
+for (i in up.pathways) {enrichment.score(DE_res, m_list, i)}
+dev.off()
+```
+
+#### Now do the GSEAs. First gene set will be HALLMARK  (n=50)
+
+```{r HALLMARK, echo=FALSE}
+geneSet = "HALLMARK" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'H') # retrieve the specific gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>% 
+  str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+gseTest_h$pathway %in% names(m_list)
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '_1.pdf'),height=8,width=7)
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10,face="bold"),legend.position = "right",
+        text = element_text(face ="bold"))+
+  ggsci::scale_fill_npg()
+dev.off()
+
+#make plots for only significant pathways with padj<0.05
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '_2.pdf'), height=10, width=10)
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10,face="bold"))+
+  scale_fill_manual(values="#355C7D")
+dev.off()
+
+#only plots w/ padj <0.05 and NES > 0
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '_3.pdf'), height=10, width=10)
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10,face="bold"))+
+  scale_fill_manual(values="#355C7D")
+dev.off()
+#then run stock code
+<<gsea_plots>>
+```
+
+#### GSEA for KEGG pathways (n=186)
+
+```{r KEGG, echo=FALSE}
+geneSet = "KEGG" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C2', subcategory = "CP:KEGG") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name) 
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=12, width=8)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 6))
+
+#make plots for only significant pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 9),
+        legend.position = "bottom")+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_manual(values="#355C7D")
+
+dev.off()
+#then run stock code
+<<gsea_plots>>
+```
+
+#### GSEA for BIOCARTA gene sets (n=292)
+
+```{r BIOCARTA, echo=FALSE}
+geneSet = "BIOCARTA" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C2', subcategory = "CP:BIOCARTA") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name) 
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 3))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_manual(values="#355C7D")
+dev.off()
+#then run stock code
+<<gsea_plots>>
+```
+
+#### GSEA for PID gene sets (n=196)
+
+```{r PID, echo=FALSE}
+geneSet = "PID" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C2', subcategory = "CP:PID") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name) 
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 4))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_manual(values="#355C7D")
+dev.off()
+#then run stock code
+<<gsea_plots>>
+```
+
+#### GSEA for WIKIPATHWAYS gene sets (n=712)
+
+```{r WIKIPATHWAYS, echo=FALSE}
+geneSet = "WP" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C2', subcategory = "CP:WIKIPATHWAYS") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name) 
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 2))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 4))+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 8))+
+  scale_fill_manual(values="#355C7D")
+
+#make same plots, but only include pathways with padj<0.05 and subset for top and bottom 10 by NES
+for(number in c(10, 20, 30, 40, 50)) {
+  df <- gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,] %>% top_n(.,number,wt=NES)
+  p <- ggplot(df,aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0("Top ", number, " ", geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_manual(values="#355C7D") 
+print(p)
+rm(df)
+rm(p)
+}
+dev.off()
+
+#then run stock code
+<<gsea_plots>>
+```
+
+#### GSEA for REACTOME gene sets (n=1635)
+
+```{r REACTOME, echo=FALSE}
+geneSet = "REACTOME" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C2', subcategory = "CP:REACTOME") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name) 
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 0.5))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 1))+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 8))+
+  scale_fill_manual(values="#355C7D")
+
+#make same plots, but only include pathways with padj<0.05 and subset for top and bottom 10 by NES
+for(number in c(10, 20, 30, 40, 50)) {
+  df <- gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,] %>% top_n(.,number,wt=NES)
+  p <- ggplot(df,aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0("Top ", number, " ", geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 10))+
+  scale_fill_manual(values="#355C7D") 
+print(p)
+rm(df)
+rm(p)
+}
+dev.off()
+
+#then run stock code
+<<gsea_plots>>
+```
+
+#### GSEA for GOBP gene sets (n=7763)
+
+```{r GOBP, echo=FALSE}
+geneSet = "GOBP" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C5', subcategory = "GO:BP") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name)  
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+# <<gsea_run>>
+gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 0.01))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 0.5), legend.position="null")+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 1))+
+  scale_fill_manual(values="#355C7D")
+
+#make same plots, but only include pathways with padj<0.05 and subset for top and bottom 10 by NES
+for(number in c(10, 20, 30, 40,50)) {
+  df <- gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,] %>% top_n(.,number,wt=NES)
+  p <- ggplot(df,aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0("Top ", number, " ", geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 8))+
+  scale_fill_manual(values="#355C7D") 
+print(p)
+rm(df)
+rm(p)
+}
+dev.off()
+#then run stock code
+<<gsea_plots>>
+
+
+### generate plots for enrichment score
+
+########
+########
+#make object up.pathways for every gene set identified with p < 0.05 and positive enrichment score
+gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES>0,]$pathway -> up.pathways
+pathways.of.interest <- c("T CELL ACTIVATION", "B CELL ACTIVATION","DENDRITIC CELL ANTIGEN PROCESSING AND PRESENTATION")
+pathways.of.interest %in% up.pathways
+
+library(fgsea)
+stat <- DE_res$stat
+names(stat) <- row.names(DE_res)
+
+plot_list <- lapply(1:length(pathways.of.interest), function(i) { 
+  pathway = pathways.of.interest[i]
+ x <- plotEnrichment(m_list[[pathway]],stat)+ 
+   # labs(title = str_wrap(pathway, 40))+
+   theme(plot.title =element_text(hjust=0.5,face="bold",size=16),
+         axis.title = element_text(face="bold",size=14),
+         axis.text = element_text(face="bold",size=12))
+# x$layers[[1]]$aes_params$size  = 1 #this comes from https://stackoverflow.com/questions/64035941/changing-the-point-size-of-a-ggplot2-object-after-creation
+  x$layers[[5]]$aes_params$size = 1
+  return(x)
+}) %>% `names<-`(pathways.of.interest)
+plot_list$`DENDRITIC CELL ANTIGEN PROCESSING AND PRESENTATION`$labels$title <- "DENDRITIC CELL ANTIGEN PROCESSING \nAND PRESENTATION"
+
+#plot these
+pdf(paste0(output.path, geneSet, "/gsea_enrichment_score_",geneSet,"_3_pathwaysOfInterest.pdf"),
+    width=7,height=5
+    )
+plot_list$`T CELL ACTIVATION`
+plot_list$`B CELL ACTIVATION`
+plot_list$`DENDRITIC CELL ANTIGEN PROCESSING AND PRESENTATION`
+dev.off()
+```
+
+#### GSEA for GOCC gene sets (n=1035)
+
+```{r GOCC, echo=FALSE}
+geneSet = "GOCC" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C5', subcategory = "GO:CC") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name) 
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 0.01))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 1))+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 6))+
+  scale_fill_manual(values="#355C7D")
+
+#make same plots, but only include pathways with padj<0.05 and subset for top and bottom 10 by NES
+for(number in c(10, 20, 30, 40,50)) {
+  df <- gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,] %>% top_n(.,number,wt=NES)
+  p <- ggplot(df,aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0("Top ", number, " ", geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 8))+
+  scale_fill_manual(values="#355C7D") 
+print(p)
+rm(df)
+rm(p)
+}
+dev.off()
+
+#then run stock code
+<<gsea_plots>>
+
+```
+
+#### GSEA for GOMF gene sets (n=1763)
+
+```{r GOMF, echo=FALSE}
+geneSet = "GOMF" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C5', subcategory = "GO:MF") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name)  
+names(m_list) = str_replace_all(names(m_list),"_"," ") %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ") %>%
+  str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 0.01))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 2))+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 1))+
+  scale_fill_manual(values="#355C7D")
+
+#make same plots, but only include pathways with padj<0.05 and subset for top and bottom 10 by NES
+for(number in c(10, 20, 30, 40,50)) {
+  df <- gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,] %>% top_n(.,number,wt=NES)
+  p <- ggplot(df,aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0("Top ", number, " ", geneSet," pathways")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 8))+
+  scale_fill_manual(values="#355C7D") 
+print(p)
+rm(df)
+rm(p)
+}
+dev.off()
+#then run stock code
+<<gsea_plots>>
+```
+
+#### GSEA for IMMUNESIGDB gene sets
+
+```{r IMMUNESIGDB, eval=F}
+geneSet = "IMMUNESIGDB" #set name of gene set under analysis
+m_df = msigdbr(species = "Homo sapiens", category = 'C7', subcategory = "IMMUNESIGDB") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name) 
+names(m_list) = str_replace_all(names(m_list),"_"," ")# %>%    str_replace(., paste0(geneSet, " "), "") #%>%
+
+#gsea_run block is commented out since I've run it before, instead load the pathwayAnalysisResults file
+<<gsea_run>>
+# gseTest_h <- read_csv(file = paste0(output.path, geneSet, "/pathwayAnalysisResults_", geneSet, ".csv"), show_col_types=F)
+
+##############
+#make gsea plots
+#clean up names on plots
+gseTest_h$pathway = str_replace_all(gseTest_h$pathway, "_", " ")# %>%
+  # str_replace(., paste0(geneSet, " "), "") #%>%
+# str_to_title()
+
+#first make enrichment score plots (these need to be included in these code chunks because the size of the text changes)
+
+pdf(file = paste0(output.path, geneSet, '/gsea_NES_', geneSet, '.pdf'), height=10, width=10)
+
+ggplot(gseTest_h, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip()+
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 0.01))
+
+#make some plots, but only include pathways with padj<0.05
+ggplot(gseTest_h[gseTest_h$padj<0.05,], aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+       ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 0.5))+
+  scale_fill_manual(values="#355C7D")
+
+#only plots w/ padj <0.05 and NES > 0
+ggplot(gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,],aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title= paste0(geneSet," pathways NES from GSEA")
+  ) + 
+  theme_minimal()+
+  theme(axis.text.y = element_text(size = 1))+
+  scale_fill_manual(values="#355C7D")
+
+#make same plots, but only include pathways with padj<0.05 and subset for top and bottom 10 by NES
+for(number in c(10, 20, 30, 40,50)) {
+  df <- gseTest_h[gseTest_h$padj<0.05 & gseTest_h$NES >0,] %>% top_n(.,number,wt=NES)
+  p <- ggplot(df,aes(reorder(pathway, NES), NES)) +
+    geom_col(aes(fill=padj<0.05)) +
+    coord_flip() +
+    labs(x="Pathway", y="Normalized Enrichment Score",
+         title= paste0("Top ", number, " ", geneSet," pathways")
+    ) + 
+    theme_minimal()+
+    theme(axis.text.y = element_text(size = 8))+
+    scale_fill_manual(values="#355C7D") 
+  print(p)
+  rm(df)
+  rm(p)
+}
+dev.off()
+#then run stock code
+<<gsea_plots>>
+```
+
+# III. Collect as xlsx
+```{r}
+files <- list.files(path=output.path, pattern="pathwayAnalysisResults_", recursive=T, full.names = T)
+list <- lapply(files, FUN=read.csv)
+names(list)  = files %>% str_replace("^.*[_]","") %>% str_replace(".csv", "")
+
+writexl::write_xlsx(list, path=paste0(output.path,"pathwayAnalysisResultsCombined.xlsx"))
+
+```
+
+# IV. SessionInfo
+
+```{r echo=FALSE}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_BulkRNAseq_GSEA.txt")
+```

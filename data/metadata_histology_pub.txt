@@ -1,0 +1,53 @@
+TLS	n_GC	Confirmed_CD21	TLS_type	Location
+J17136_P02-10	1	Yes	Mature	Peritumoral
+J17136_P02-11	1	Yes	Mature	Adjacent Normal
+J17136_P02-12	1	Yes	Mature	Adjacent Normal
+J17136_P02-13	1	Yes	Mature	Adjacent Normal
+J17136_P02-14	1	No	Mature	Peritumoral
+J17136_P02-15	3	No	Mature	Peritumoral
+J17136_P02-3	2	Yes	Mature	Peritumoral
+J17136_P02-5-6	3	Yes	Mature	Adjacent Normal
+J17136_P02-7-9	2	Yes	Mature	Adjacent Normal
+J17136_P02-8	1	Yes	Mature	Adjacent Normal
+J17136_P03-2A	1	No	Mature	Peritumoral
+J17136_P03-2AB	1	No	Involuted	Intratumoral
+J17136_P03-2B	1	No	Mature	Peritumoral
+J17136_P03-2C	1	No	Mature	Peritumoral
+J17136_P03-2D	1	No	Mature	Peritumoral
+J17136_P03-3C	1	Yes	Mature	Peritumoral
+J17136_P07-2A	1	Yes	Mature	Adjacent Normal
+J17136_P07-2C	1	No	Mature	Adjacent Normal
+J17136_P07-2D	0	No	Mature	Adjacent Normal
+J17136_P07-2E	1	No	Mature	Adjacent Normal
+J17136_P07-3A	1	Yes	Mature	Adjacent Normal
+J17136_P07-3B	1	Yes	Mature	Adjacent Normal
+J17136_P08-1A	1	Yes	Mature	Peritumoral
+J17136_P08-1B	2	Yes	Mature	Peritumoral
+J17136_P08-1C	2	Yes	Mature	Peritumoral
+J17136_P08-1D	0	No	Mature	Peritumoral
+J17136_P08-1E	1	Yes	Mature	Peritumoral
+J17136_P08-2C	1	Yes	Mature	Peritumoral
+J17136_P08-3A	1	Yes	Mature	Peritumoral
+J17136_P08-4A	1	Yes	Mature	Peritumoral
+J17136_P08-4B	0	No	Mature	Peritumoral
+J17136_P12-1B	1	Yes	Mature	Peritumoral
+J17136_P12-1E	1	No	Involuted	Intratumoral
+J17136_P12-2A	1	Yes	Mature	Peritumoral
+J17136_P12-2B	2	Yes	Mature	Peritumoral
+J17136_P12-2C	1	Yes	Mature	Peritumoral
+OT1-1	1	Yes	Mature	Intratumoral
+OT1-2	3	Yes	Mature	Intratumoral
+OT1-3	3	Yes	Mature	Intratumoral
+OT1-4	1	Yes	Mature	Intratumoral
+OT1-4C	1	Yes	Mature	Intratumoral
+OT1-4D	1	No	Involuted	Intratumoral
+OT1-5	1	Yes	Mature	Intratumoral
+OT1-6	3	Yes	Mature	Intratumoral
+OT6-1A	1	Yes	Mature	Intratumoral
+OT6-1B	2	Yes	Mature	Intratumoral
+OT6-2A	1	Yes	Mature	Intratumoral
+OT6-2E	1	Yes	Mature	Intratumoral
+OT6-2G	1	Yes	Mature	Intratumoral
+OT6-3A	1	No	Involuted	Intratumoral
+OT6-3B	1	No	Involuted	Intratumoral
+OT6-3C	1	No	Involuted	Intratumoral

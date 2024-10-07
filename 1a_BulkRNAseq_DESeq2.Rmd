@@ -1,0 +1,646 @@
+---
+title: "Bulk RNAseq_DESeq2"
+author: Ludmila Danilova (modified by Daniel Shu)
+date: 2021-11-09 (2022-05-11) with further modifications on 2022/10/5
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE
+)
+```
+
+# I. Setup
+### a. Load libraries
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(DESeq2)
+library(ggrepel)
+library(msigdbr)
+library(data.table)
+library("DT")
+library(RColorBrewer)
+library(viridis)
+library(EnhancedVolcano)
+library(ggplotify)
+library(tools)
+library(pca3d)
+library(edgeR)
+library(pheatmap)
+library("ComplexHeatmap")
+library(circlize)
+library(ggprism)
+library(writexl)
+
+dataDir = "data/BulkRNAseq/rna_gene_expression/"
+output.path = "output/RNAseq/"
+ifelse(!dir.exists(output.path), dir.create(output.path), paste0(output.path, " ", "directory already exists"))
+```
+
+# II. Load data
+### a. load sampInfo file
+```{r}
+sampInfo <- readRDS("output/sampInfo.rds") 
+
+# fix patient IDs to map to Personalis folder names
+sampInfo$Publication.ID = sampInfo$Publication.ID %>% 
+  str_replace_all(c(#"17136"="J17136","-"="_",
+                                        "OT1" = "OT1_Tumor",
+                                        "OT2" = "OT2_Tumor_Replacement",
+                                        "OT4"= "OT4_Tumor",
+                                        "OT5"= "OT5_Tumor_Replacement",
+                                        "OT6"="OT6_Tumor"))
+
+rownames(sampInfo) = sampInfo$Publication.ID
+
+# sampInfo %>% View
+sampInfo <- sampInfo %>%  
+  filter(group=="Neoadjuvant")  #subset for only neoadjuvant treated tumors
+
+sampInfo <- sampInfo %>% filter(!(BulkRNA.seq=="0")) %>% #subset for samples with bulk RNAseq data
+  arrange(Publication.ID) #reorder to facilitate matching up with patient.names object in next code chunk
+  
+#add TLS column
+TLS.mean = mean(sampInfo$TLS.Density)
+sampInfo$TLS = if_else(sampInfo$TLS.Density < TLS.mean, "Low", "High")
+sampInfo$TLS = as.factor(sampInfo$TLS)
+sampInfo$TLS = factor(sampInfo$TLS, levels=c("Low", "High"))
+
+#Set colors for analysis
+TLSCol = c('High' =  "#631879E5", 'Low' =  "#008280E5")
+Etiology.2Col = c('Viral' = '#36454F', 'Non-Viral' = '#D3D3D3')
+respCol=c('MPR/pCR'="#EE0000E5", 'pPR' = "#008B45E5", 'NR' = "#3B4992E5")
+treatmentCol =  c('anti-PD1 + TKI' = "#0056a2", 
+                  # 'anti-PD1 + anti-CTLA4 + TKI' = "#56a200",
+                  'anti-PD1'= "#A20056E5"
+                    )
+relapseCol =   c(Yes="#d6d091", 
+                 No="#91bad6") 
+TLSdensityCol = colorRamp2(c(0,0.4), c("#e9e6f3", "#631879E5"))
+```
+
+
+### c. Read in count data for all patients and create tpmData and countData objects
+
+```{r echo=FALSE,  fig.width = 10}
+tpmData = c()
+countData = c()
+files = list.files(dataDir, pattern = "_rna_gene_expression_report.tsv", full.names = T, recursive=T)
+for( i in files){
+   dat = read.table(i,
+                   header = T, 
+                   stringsAsFactors = F, 
+                   as.is = T, 
+                   fill = T, 
+                   comment.char = "", 
+                   sep = '\t')
+  tpmData = cbind(tpmData,dat[which(!duplicated(dat$Gene.Symbol)),'TPM'])
+  countData = cbind(countData,dat[which(!duplicated(dat$Gene.Symbol)),'RNA.Seq.Raw.Counts'])
+}
+
+# extract names from files vector, changing strings to match Publication.ID column of object sampInfo
+patient.names <- file_path_sans_ext(basename(files))%>%
+  str_replace(".*RNA_", "") %>%
+  str_replace("_FFPE.*", "") %>%
+  str_replace("_tumor.*", "") %>%
+  str_replace("-", "_") %>% sort
+patient.names
+#doublecheck that patient names object contains the correct information. this should return TRUE TRUE TRUE, etc.
+patient.names == sampInfo$Publication.ID
+
+#assign rownames to tpmData and countData as gene symbols 
+rownames(tpmData) = rownames(countData) = dat[which(!duplicated(dat$Gene.Symbol)),'Gene.Symbol']
+#assign colnames to tpmData and countData using modified filenames
+colnames(tpmData) =colnames(countData) = patient.names
+
+```
+
+### d. Check counts data using log2 transformation. Here we add “+1” because log0 does not exist but log1=0.
+
+```{r echo=FALSE,  fig.width = 10}
+counts.matrix.log <- log2(countData+1)
+par(mar=c(12,5,2,2))
+boxplot(counts.matrix.log, las=2, ylab="log2(counts+1)")
+rm(counts.matrix.log)
+
+# based on this, I ultimately excluded OT2_Tumor_Replacement and OT6_Tumor from the analysis since the median count was 0. 
+# first removed them from sampInfo 
+sampInfo <- sampInfo %>%  filter(!(Publication.ID==c("OT2_Tumor_Replacement", "OT6_Tumor")))
+#then removed them from countData and tpmData objects
+countData = countData[, sampInfo[,1]]
+tpmData = tpmData[, sampInfo[,1]]
+
+#make new plot of log2 transformation again with OT2 and OT6 excluded
+counts.matrix.log <- log2(countData+1)
+par(mar=c(12,5,2,2))
+boxplot(counts.matrix.log, las=2, ylab="log2(counts+1)")
+rm(counts.matrix.log)
+```
+
+# III. DESeq2 analysis of TLS high vs TLS low
+### a. Preprocessing: Create DeSeq object from counts matrix and do PCA analysis
+### note here I did not include batch as variate based on results of plotPCA below
+
+```{r echo=FALSE,  fig.width = 10}
+dds <- DESeqDataSetFromMatrix(countData, 
+                              sampInfo, 
+                              design = ~TLS)
+dds <- dds[rowSums(counts(dds))>1,]
+
+# vst transformation for visualization
+logSTCDataSet <- vst(dds)
+
+# expression matrix
+expr = assays(logSTCDataSet)[[1]]
+
+par(mar=c(12,5,2,2))
+boxplot(expr, las=2, ylab="expression matrix after vst")
+
+### PCA using plotPCA function in DESeq2. 
+pcaData <- plotPCA(logSTCDataSet, intgroup = "TLS",returnData=T)
+percentVar <- round(100*attr(pcaData,"percentVar"))
+pcaData$TLS <- factor(pcaData$TLS, levels=c("High", "Low"))
+ggplot(pcaData,aes(PC1,PC2, fill=TLS))+#, label=name))+
+  geom_point(shape=21,size=9,colour="black")+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  scale_fill_manual("",values = TLSCol,labels=c("High"="TLS High", "Low"="TLS Low"))+
+  ggprism::theme_prism()+
+  theme(legend.position = c(0.5,0.96), legend.text=element_text(face="bold"),
+        text = element_text(size=16)
+        )+
+  guides(fill = guide_legend(nrow = 1))
+
+ggsave("output/RNAseq/pca_by_TLS.pdf",  bg = "transparent", height=6, width=9)
+
+# This identifies J17136_P13 and OT4_Tumor as outliers
+plotPCA(logSTCDataSet, intgroup = "Batch") + geom_text(aes(label=name),hjust=0, vjust=0) +
+  coord_cartesian(clip="off")
+ggsave("output/RNAseq/pca_by_Batch.pdf")
+
+# Second check using PCA3d library
+# This identifies OT4_Tumor and J17136_P13 as outliers. OT5_Tumor_Replacement and J17136_02 are also outliers, but they are at least on the same PC 2 scale as the other samples.  
+# Overall, no clear batch to batch differences, so did not exclude samples based on batch effect
+pcs <- prcomp(t(expr),scale=T)
+
+pca2d(prcomp(t(expr), scale=T), 
+      group=sampInfo$Batch,
+      legend="top",
+      show.labels=T
+      )
+title('PCA of vst counts orig filter')
+ggsave("output/RNAseq/2D_pca_by_Batch.pdf")
+
+```
+
+###  b. Perform DEseq2 analysis
+```{r echo = FALSE}
+dds_res <- DESeq(dds, betaPrior = F)
+resultsNames(dds_res)
+DE_res = results(dds_res)
+
+# Determine DEGs for visualization below
+FCthr = 1
+FDR = 0.05
+plot_FCthr = 10
+plot_FDR = 1e-30
+
+DE_res = DE_res[which(!is.na(DE_res$padj)),]
+res <- list(DE_res = DE_res, 
+		# gene names to plot on volcano
+		signPlot = row.names(DE_res)[which(abs(DE_res$log2FoldChange) > plot_FCthr | DE_res$padj < plot_FDR)],
+		# significant genes to save into file
+		signSave = row.names(DE_res)[which(abs(DE_res$log2FoldChange) > FCthr & DE_res$padj < FDR)])
+	
+#	print(c('genes to print',length(res$signPlot)))
+	print(c('significant genes',length(res$signSave)))
+	# gene names to plot on volcano
+	DE_res$label = F
+	DE_res[res$signPlot,'label'] = TRUE
+	DE_res$gene_symbol = rownames(DE_res)
+	DE_res$diffexpressed <- FALSE
+	DE_res[res$signSave,'diffexpressed'] <- TRUE
+
+significantGenes <-	as.data.frame(res$DE_res[res$signSave,])	
+write.csv(significantGenes, file = "./output/RNAseq/significantGenes.csv", quote = F)
+datatable(significantGenes)
+```
+### c. Visualization
+#### 1. Volcano plots
+```{r volc_plots, eval=T}
+#This was Luda's code
+pdf("output/RNAseq/volcano_plots_luda.pdf", width=10, height=8)
+	gobj = ggplot(data=data.frame(DE_res), aes(x=log2FoldChange, y=-log10(padj), col=diffexpressed)) + 
+		geom_point() + 
+		theme_minimal() +		
+		geom_text_repel(aes(x = log2FoldChange, y = -log10(padj), label = ifelse(label == T, rownames(DE_res),""))) +
+	   xlab("log2 fold change") + 
+	  ylab("-log10 adjusted p-value")
+
+print(gobj)
+dev.off()
+
+#Make a volcano plot using enhancedVolcano
+volc_plot <- EnhancedVolcano(DE_res,
+    lab = rownames(DE_res),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = 'TLS high vs low', 
+    subtitle = NULL,
+    caption = paste0("total = ", nrow(DE_res), " genes"),
+  xlim = c(min(DE_res[['log2FoldChange']], na.rm = TRUE) - 0.5, max(DE_res[['log2FoldChange']], na.rm = TRUE) +
+    0.5),
+  ylim = c(0, max(-log10(DE_res[['pvalue']]), na.rm = TRUE) + 0.5),
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 1,
+    labSize = 3.25,
+    labCol = 'black',
+    labFace = 'bold',
+    colAlpha=1,
+    legendLabSize = 12,
+    legendIconSize = 3,
+    gridlines.major = FALSE, gridlines.minor = FALSE
+)
+
+pdf("output/RNAseq/volcano_plots_1.pdf", width=10, height=8)
+volc_plot
+dev.off()
+
+#volcano plot for certain goi
+#load volcano_goi object, which contains numerous immune related genes
+source("./scripts/volcano_goi.R")
+
+volc_plot.2 <- EnhancedVolcano(DE_res,
+    lab = rownames(DE_res),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = 'TLS high vs low', 
+    subtitle = 'Curated TLS- or B- cell relevant list',
+    caption = paste0("total = ", nrow(DE_res), " genes"),
+    # xlim = c(-10, 10),
+    # ylim = c(0, 20),
+      xlim = c(min(DE_res[['log2FoldChange']], na.rm = TRUE) - 0.5, max(DE_res[['log2FoldChange']], na.rm = TRUE) +
+    0.5),
+  ylim = c(0, max(-log10(DE_res[['pvalue']]), na.rm = TRUE) + 0.5),
+    selectLab = volcano_goi[volcano_goi %in% rownames(significantGenes)], 
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 0.5,
+    labSize = 3,
+    labCol = 'black',
+    labFace = 'bold',
+    boxedLabels = TRUE,
+    colAlpha=1,
+    legendLabSize = 12,
+    legendIconSize = 3,
+    maxoverlapsConnectors = 50,
+    drawConnectors = TRUE,
+    widthConnectors = 0.8,
+    typeConnectors = "closed",
+    arrowheads = FALSE,
+    gridlines.major = FALSE, gridlines.minor = FALSE
+)
+pdf("output/RNAseq/volcano_plots_2.pdf", width=10, height=8)
+volc_plot.2
+dev.off()
+
+chemo12 = unlist(read.table(paste0(dataDir,'chemokine_signature.txt')))
+
+volc_plot.chemo12 <- EnhancedVolcano(DE_res,
+    lab = rownames(DE_res),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = 'TLS high vs low', 
+    subtitle = '12-chemokine gene signature',
+    caption = paste0("total = ", nrow(DE_res), " genes"),
+      xlim = c(min(DE_res[['log2FoldChange']], na.rm = TRUE) - 0.5, max(DE_res[['log2FoldChange']], na.rm = TRUE) +
+    0.5),
+  ylim = c(0, max(-log10(DE_res[['pvalue']]), na.rm = TRUE) + 0.5),
+    selectLab = chemo12,
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 1,
+    labSize = 3.25,
+    labCol = 'black',
+    labFace = 'bold',
+    colAlpha=1,
+    legendLabSize = 12,
+    legendIconSize = 3,
+    maxoverlapsConnectors = 50,
+    drawConnectors = TRUE,
+    widthConnectors = 0.8,
+    typeConnectors = "closed",
+    arrowheads = FALSE,
+    gridlines.major = FALSE, gridlines.minor = FALSE
+)
+
+pdf("output/RNAseq/volcano_plots_chemo12.pdf", width=10, height=8)
+volc_plot.chemo12
+dev.off()
+
+volc_plot_select <- EnhancedVolcano(DE_res,
+    lab = rownames(DE_res),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = 'TLS high vs low', 
+    subtitle = NULL,
+    caption = paste0("total = ", nrow(DE_res), " genes"),
+     xlim = c(min(DE_res[['log2FoldChange']], na.rm = TRUE) - 0.5, max(DE_res[['log2FoldChange']], na.rm = TRUE) +
+    0.5),
+  ylim = c(0, max(-log10(DE_res[['pvalue']]), na.rm = TRUE) + 0.5),
+
+   selectLab = c("MS4A1", "TNFRSF13C", "TNFRSF13B", "IL6", "CCL2", "IL7R", "CTLA4", "IL10", "CCR7", "CD28", "GPR183", "CD79B", "CXCR5", "FCRL1", "CD79A", "CCL19", "TNFSF13B", "CD69", "IL17C", "ENPTD1", "MADCAM1"), #comment this line out to get all genes labeled
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 1,
+    labSize = 3,
+    labCol = 'black',
+    labFace = 'bold',
+    boxedLabels = TRUE,
+    colAlpha=1,
+    legendLabSize = 12,
+    legendIconSize = 3,
+    maxoverlapsConnectors = 100,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    typeConnectors = "closed",
+    arrowheads = FALSE,
+    gridlines.major = FALSE, gridlines.minor = FALSE
+)
+
+pdf("output/RNAseq/volcano_plots_selectGenes.pdf", width=10, height=8)
+volc_plot_select
+dev.off()
+
+volc_plot_select.widerYAxis <- EnhancedVolcano(DE_res,
+    lab = rownames(DE_res),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = 'TLS high vs low', 
+    subtitle = NULL,
+    caption = paste0("total = ", nrow(DE_res), " genes"),
+     xlim = c(min(DE_res[['log2FoldChange']], na.rm = TRUE) - 0.5, max(DE_res[['log2FoldChange']], na.rm = TRUE) +
+    0.5),
+  ylim = c(0, max(-log10(DE_res[['pvalue']]), na.rm = TRUE) + 0.5),
+
+   selectLab = c("MS4A1", "TNFRSF13C", "TNFRSF13B", "IL6", "CCL2", "IL7R", "CTLA4", "IL10", "CCR7", "CD28", "GPR183", "CD79B", "CXCR5", "FCRL1", "CD79A", "CCL19", "TNFSF13B", "CD69", "IL17C", "ENPTD1", "MADCAM1"), #comment this line out to get all genes labeled
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 1,
+    labSize = 3,
+    labCol = 'black',
+    labFace = 'bold',
+    boxedLabels = TRUE,
+    colAlpha=1,
+    legendLabSize = 12,
+    legendIconSize = 3,
+    maxoverlapsConnectors = 100,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    typeConnectors = "closed",
+    arrowheads = FALSE,
+    gridlines.major = FALSE, gridlines.minor = FALSE
+)
+
+pdf("output/RNAseq/volcano_plots_widerY.pdf", width=10, height=8)
+volc_plot_select.widerYAxis
+dev.off()
+
+
+volc_plot_select.narrowXY<- EnhancedVolcano(DE_res,
+    lab = rownames(DE_res),
+    x = 'log2FoldChange',
+    y = 'pvalue',
+    title = 'TLS low vs TLS high', 
+    subtitle = NULL,
+    caption = paste0("total = ", nrow(DE_res), " genes"),
+   xlim = c(-10, 10),
+   ylim = c(0, 14),
+   selectLab = c("MS4A1", "TNFRSF13C", "TNFRSF13B", "IL6", "CCL2", "IL7R", "CTLA4", "IL10", "CCR7", "CD28", "GPR183", "CD79B", "CXCR5", "FCRL1", "CD79A", "CCL19", "TNFSF13B", "CD69", "IL17C", "ENPTD1", "MADCAM1"), #comment this line out to get all genes labeled
+    xlab = bquote(~Log[2]~ 'fold change'),
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 1,
+    labSize = 5.25,
+    labCol = 'black',
+    labFace = 'bold',
+    boxedLabels = T,
+    colAlpha=1,
+    legendLabSize = 12,
+    legendIconSize = 4,
+    maxoverlapsConnectors = 100,
+    drawConnectors = TRUE,
+    widthConnectors = 1,
+    typeConnectors = "closed",
+    arrowheads = FALSE,
+    gridlines.major = FALSE, gridlines.minor = FALSE,
+  cutoffLineWidth = 0.8
+  )
+
+volc_plot_select.narrowXY$labels$y <- "-log10(Padj)"
+volc_plot_select.narrowXY$labels$x <-"log2 fold change"
+
+volc_plot_select.narrowXY <- volc_plot_select.narrowXY+scale_y_continuous(expand = c(0, 0))+
+  theme(plot.title = element_text(hjust=0.5),
+        axis.line = element_line(linewidth=1),
+        legend.position="top",
+      legend.box.spacing = unit(10, "pt")) # The spacing between the plotting area and the legend box (unit)
+        
+volc_plot_select.narrowXY
+
+pdf("output/RNAseq/volcano_plots_narrowXY.pdf",width=9,height=8)
+volc_plot_select.narrowXY
+dev.off()
+```
+#### 2. Heatmap for all DEGs
+Heatmap will be annotated for genes present in select GOBP pathways 
+```{r heatmaps, echo = FALSE, eval=T}
+#scale expression data
+expr_scale = t(scale(t(expr), center=T))
+head(expr)
+head(expr_scale)
+
+# 1a.heatmap of significant genes with complex heatmap
+mat = expr_scale[res$signSave, ]
+
+## load T cell, B cell, and antigen presenting cell gene lists, etc 
+m_df = msigdbr(species = "Homo sapiens", category = 'C5', subcategory = "GO:BP") # gene sets for pathway analysis
+m_list = m_df %>% split(x = .$gene_symbol, f = .$gs_name)
+
+df=data.frame(names=names(m_list),
+              n_hits = sapply (1:length(m_list), function(i) {sum(rownames(mat) %in% m_list[[i]])})
+) %>% arrange(., desc(n_hits))
+
+write_csv(df,file="output/RNAseq/n_significantGenes_in_GOBP_pathways.csv")
+
+cc = m_list$GOBP_T_CELL_ACTIVATION
+ccl = rownames(mat) %in% cc
+
+rp = m_list$GOBP_B_CELL_ACTIVATION
+rpl = rownames(mat) %in% rp
+
+ck = m_list$GOBP_CYTOKINE_PRODUCTION_INVOLVED_IN_IMMUNE_RESPONSE
+ckl = rownames(mat) %in% ck
+
+ap = m_list$GOBP_DENDRITIC_CELL_ANTIGEN_PROCESSING_AND_PRESENTATION
+apl = rownames(mat) %in% ap
+
+#export list of genes identified by cross-reference against GOBP
+deg_by_geneSet <- list(t_cell_activation = rownames(mat)[ccl], 
+       b_cell_activation = rownames(mat)[rpl],
+       cytokine_production = rownames(mat)[ckl],
+       antigen_presentation = rownames(mat)[apl]
+       ) %>% 
+  lapply(., as.data.frame) %>% lapply(., setNames, "Gene")
+
+write_xlsx(deg_by_geneSet,path="output/RNAseq/deg_by_geneSet.xlsx")
+
+row_ann_l <- rownames(mat) %in% c(cc, rp,  
+                                  ck, 
+                                  ap)
+
+
+
+#reverse levels on sampInfo$TLS to for sake of heatmap
+sampInfo$TLS <- factor(sampInfo$TLS, levels=c("High", "Low"))
+
+#add Etiolgoy.2 column to sampInfo
+sampInfo$Etiology.2 = case_when(
+      str_detect(sampInfo$Etiology, regex("HCV|HBV/HCV", ignore_case=TRUE)) ~ "Viral",
+      str_detect(sampInfo$Etiology, regex("Unknown|Alcohol|NASH", ignore_case=TRUE)) ~ "Non-Viral")
+sampInfo$Etiology.2 = factor(sampInfo$Etiology.2,levels=c("Viral", "Non-Viral"))
+      
+#define heatmap annotations for top of heatmap
+ha = HeatmapAnnotation(TLS= sampInfo[,'TLS'],
+                       Etiology = sampInfo[,'Etiology.2'],
+                       Treatment = sampInfo[, 'Treatment'],
+                       Response = sampInfo[,'Response'], 
+                       Relapse = sampInfo[, 'Relapse'],
+                       `TLS Density` = sampInfo[,"TLS.Density"],
+                       col = list(TLS=TLSCol,
+                                  Etiology = Etiology.2Col,
+                                  Response = respCol,
+                                  Treatment=treatmentCol,
+                                  Relapse = relapseCol
+                                  ,
+                                  `TLS Density` = TLSdensityCol
+                                  ),
+                       simple_anno_size = unit(0.3, "cm"),
+                       annotation_name_gp= gpar(fontsize = 9, fontface="bold"),
+                       annotation_name_side = "left",
+                       gp = gpar(col = "white"))
+
+library(GetoptLong)
+ht_list = Heatmap(mat,
+        col= inferno(100), #col_fun, 
+          #column_title = qq("DEGs in TLS high vs TLS low (n = 814)"),
+        # column_title_gp = gpar(fontsize = 10, fontface = "bold"),
+        show_column_names=F,#,width=unit(14, "cm"),
+        name = "scaled_expr",
+        row_names_gp = gpar(fontsize = 4),
+        top_annotation = ha, #see above
+        heatmap_legend_param = list(title = "Expression"
+                                    # ,direction="horizontal"
+                                    ))+ 
+  Heatmap(ccl + 0, name = "T cell activation", col = c("0" = "white", "1" = "red"),
+        show_heatmap_legend = FALSE, width = unit(5, "mm"), 
+        column_names_side = "top", column_names_rot = 90,
+        column_names_gp = gpar(fontsize = 9, fontface="bold"))+
+  Heatmap(rpl + 0, name = "B cell activation", col = c("0" = "white", "1" = "purple"),
+        show_heatmap_legend = FALSE, width = unit(5, "mm"),
+        column_names_side = "top", column_names_rot = 90,
+        column_names_gp = gpar(fontsize = 9, fontface="bold"))+
+  Heatmap(ckl + 0, name = "Cytokine production", col = c("0" = "white", "1" = "blue"),
+        show_heatmap_legend = FALSE, width = unit(5, "mm"),
+        column_names_side = "top", column_names_rot = 90,
+        column_names_gp = gpar(fontsize = 9, fontface="bold"))+
+  Heatmap(apl + 0, name = "Antigen presentation", col = c("0" = "white", "1" = "orange"),
+        show_heatmap_legend = FALSE, width = unit(5, "mm"),
+        column_names_side = "top", column_names_rot = 90,
+        column_names_gp = gpar(fontsize = 9, fontface="bold"))+
+  # Heatmap(lml + 0, name = "Leukocyte migration", col = c("0" = "white", "1" = "green"),
+  #       show_heatmap_legend = FALSE, width = unit(5, "mm"),
+  #       column_names_side = "top", column_names_rot = 90,
+  #       column_names_gp = gpar(fontsize = 9, fontface="bold"))+
+  rowAnnotation(link = anno_mark(at = which(row_ann_l
+                                              #& base_mean > quantile(base_mean, 0.25)
+                                              ),
+                                   labels = rownames(mat)[row_ann_l 
+                                                          # &base_mean > quantile(base_mean, 0.25)
+                                                          ],
+        labels_gp = gpar(fontsize = 7, fontface="italic"), padding = unit(0.2, "mm")))
+
+ht_list = draw(ht_list, main_heatmap = "scaled_expr", ht_gap = unit(0.75, "mm"), 
+               merge_legend = TRUE,
+               annotation_legend_side="right",
+               heatmap_legend_side="right")
+
+pdf("output/RNAseq/complexHeatmap.pdf", width = 7, height = 16)
+ht_list
+dev.off()
+```
+
+#### 3. Heatmap for 12-chemokine signature
+
+```{r}
+# use the object containing scaled VST transformed expression data, expr_scale, to plot 12 chemokine signature
+chemo12 = unlist(read.table(paste0(dataDir,'chemokine_signature.txt')))
+
+mat2 = expr_scale[rownames(expr_scale) %in% chemo12,]
+
+ht_list2 =
+  Heatmap(mat2,
+        col= rev(pals::brewer.rdbu(100)), #col_fun, 
+          # column_title = qq("DEGs in TLS high vs TLS low (n = 814)"),
+        # column_title_gp = gpar(fontsize = 10, fontface = "bold"),
+        show_column_names=F,#,width=unit(14, "cm"),
+        name = "scaled_expr",
+        row_names_gp = gpar(fontsize = 10),
+        top_annotation = ha, #see above
+        heatmap_legend_param = list(title = "Expression"
+                                    # ,direction="horizontal"
+                                    ),
+        width = ncol(mat2)*unit(8, "mm"),
+    height = nrow(mat2)*unit(6, "mm")
+    )
+
+ht_list2 = draw(ht_list2, main_heatmap = "scaled_expr", ht_gap = unit(0.75, "mm"), 
+               merge_legend = F,
+               annotation_legend_side="bottom",
+               heatmap_legend_side="right")
+pdf("output/RNAseq/complexHeatmap_12chemokine.pdf")
+ht_list2
+dev.off()
+
+```
+
+# IV. Save object
+```{r}
+#save DE_res object for GSEA in next rmd
+saveRDS(DE_res, paste0(output.path,"DE_res.rds"))
+```
+
+# V. SessionInfo
+
+```{r echo=FALSE}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "sessionInfo_BulkRNAseq_DESeq2.txt")
+```
